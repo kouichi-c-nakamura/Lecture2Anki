@@ -55,9 +55,9 @@ cur_data = presets.get(selected_p, {}) if selected_p != "(新規入力)" else {}
 
 with st.sidebar:
     st.header("講義・デッキ設定")
-    deck_name = st.text_input("Deck名 (階層可)", value=cur_data.get("deck_name", "病理学::12 環境と発癌"))[cite: 1]
-    group_title = st.text_input("グループタイトル", value=cur_data.get("group_title", "環境と発癌"))[cite: 1]
-    pdf_pass = st.text_input("PDFパスワード (空白可)", value=cur_data.get("password", ""), type="password")[cite: 1]
+    deck_name = st.text_input("Deck名 (階層可)", value=cur_data.get("deck_name", "病理学::12 環境と発癌"))
+    group_title = st.text_input("グループタイトル", value=cur_data.get("group_title", "環境と発癌"))
+    pdf_pass = st.text_input("PDFパスワード (空白可)", value=cur_data.get("password", ""), type="password")
     base_folder = st.text_input("講義フォルダ", value=cur_data.get("base_folder", ""))
     
     if st.button("現在の設定をプリセット保存"):
