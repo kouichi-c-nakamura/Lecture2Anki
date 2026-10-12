@@ -18,3 +18,8 @@ exported_jpgs/
 lecture_presets.json
 ai_notes_cache.json
 .DS_Store
+
+#skills etc
+.agents/*
+.claude/*
+.vscode/*
