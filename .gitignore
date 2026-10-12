@@ -1,0 +1,20 @@
+# Python 仮想環境・キャッシュ
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# 環境変数（APIキー漏洩防止）
+.env
+
+# 講義PDFおよび生成画像・中間データ（著作権・個人情報保護）
+*.pdf
+exported_jpgs/
+*.apkg
+
+# 個人プリセット・キャッシュ設定
+lecture_presets.json
+ai_notes_cache.json
+.DS_Store
