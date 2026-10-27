@@ -4,6 +4,8 @@ import glob
 import json
 import subprocess
 import shutil
+import io
+import base64
 from PIL import Image
 from dotenv import load_dotenv
 from pipeline_util import (
@@ -29,12 +31,15 @@ CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
 
-# 最新Flashモデル料金設定 (USD / 1M tokens)
+# 公式ドキュメント (ai.google.dev/gemini-api/docs/pricing) 準拠の正確な料金 (USD / 1M tokens)
+# ※ 3.6 / 3.8 Flash は 2026年12月31日までの特別導入価格 ($0.75 / $3.75) を反映
 PRICING_MODELS = {
-    "Gemini 2.5 Flash-Lite (最安)": {"id": "gemini-2.5-flash-lite", "in": 0.10, "out": 0.40},
-    "Gemini 3.5 Flash-Lite (高コスパ)": {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
-    "Gemini 3.6 Flash (バランス推奨)": {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
-    "Gemini 3.8 Flash (高推論)":       {"id": "gemini-3.8-flash",      "in": 0.75, "out": 3.75},
+    "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
+    "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
+    "Gemini 3.8 Flash (高推論Flash)":       {"id": "gemini-3.8-flash",      "in": 0.75, "out": 3.75},
+    "Gemini 4 Argon (〜11/30 特割)":        {"id": "gemini-4-argon",        "in": 2.00, "out": 10.00},
+    "Gemini 4 Argon (12/1〜 通常)":         {"id": "gemini-4-argon",        "in": 4.00, "out": 20.00},
+    "Gemini 2.5 Flash (レガシー)":          {"id": "gemini-2.5-flash",      "in": 0.30, "out": 2.50},
 }
 USD_JPY = 155.0
 
@@ -70,7 +75,7 @@ def keep_recent_prompt(p_text):
     store = get_prompt_store()
     recent = [p for p in store.get("recent", []) if p != p_clean]
     recent.insert(0, p_clean)
-    store["recent"] = recent[:5]  # 最新5個を自動でkeep
+    store["recent"] = recent[:5]
     save_prompt_store(store)
 
 # --- ファイル / フォルダ選択ダイアログ (macOS Finder) ---
@@ -85,10 +90,14 @@ def choose_file_dialog(title="ファイルを選択"):
     return res.stdout.strip() if res.returncode == 0 else None
 
 @st.cache_data(show_spinner=False)
-def get_low_res_thumb(img_path, width=180):
+def get_thumb_b64(img_path, width=200):
+    """幅200px固定のサムネイルを生成してキャッシュする"""
     img = Image.open(img_path)
     w, h = img.size
-    return img.resize((width, int(h * (width / w))), Image.BILINEAR)
+    thumb = img.resize((width, int(h * (width / w))), Image.BILINEAR)
+    buf = io.BytesIO()
+    thumb.save(buf, format="JPEG", quality=80)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 st.set_page_config(page_title="PDF to Anki + AI Enhancer", layout="wide")
@@ -97,27 +106,45 @@ st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 # --- サイドバー: 講義設定と履歴 ---
 presets = get_presets()
 preset_names = ["(新規入力)"] + list(presets.keys())
-selected_p = st.sidebar.selectbox("📂 講義プリセット呼び出し", preset_names)
-cur_data = presets.get(selected_p, {}) if selected_p != "(新規入力)" else {}
 
-# プリセット切り替え時のパス同期
-if "last_selected_preset" not in st.session_state or st.session_state.last_selected_preset != selected_p:
-    st.session_state.last_selected_preset = selected_p
-    bf = cur_data.get("base_folder", "")
+# 1. 初回起動時のセッションステート初期化（直近保存されたプリセットがあればそれをロード）
+if "deck_name_val" not in st.session_state:
+    # プリセットが1件以上あれば先頭のものを初期値にする
+    initial_p = preset_names[1] if len(preset_names) > 1 else "(新規入力)"
+    cur = presets.get(initial_p, {})
+    st.session_state.deck_name_val = cur.get("deck_name", "病理学::12 環境と発癌")
+    st.session_state.group_title_val = cur.get("group_title", "環境と発癌")
+    st.session_state.pdf_pass_val = cur.get("password", "")
+    bf = cur.get("base_folder", "")
     st.session_state.base_folder_val = bf
     st.session_state.unmasked_pdf_val = os.path.join(bf, "講義.pdf") if bf else ""
     st.session_state.masked_pdf_val = os.path.join(bf, "講義 masked.pdf") if bf else ""
 
-if "slide_idx" not in st.session_state:
-    st.session_state.slide_idx = 0
-if "custom_prompt_val" not in st.session_state:
-    st.session_state.custom_prompt_val = DEFAULT_PROMPT
+# 2. プリセット変更時に実行されるコールバック（描画前に確実に代入される）
+def on_preset_change():
+    sel = st.session_state.selected_preset_key
+    if sel != "(新規入力)" and sel in presets:
+        p_data = presets[sel]
+        st.session_state.deck_name_val = p_data.get("deck_name", "")
+        st.session_state.group_title_val = p_data.get("group_title", "")
+        st.session_state.pdf_pass_val = p_data.get("password", "")
+        bf = p_data.get("base_folder", "")
+        st.session_state.base_folder_val = bf
+        st.session_state.unmasked_pdf_val = os.path.join(bf, "講義.pdf") if bf else ""
+        st.session_state.masked_pdf_val = os.path.join(bf, "講義 masked.pdf") if bf else ""
 
 with st.sidebar:
     st.header("講義・デッキ設定")
-    deck_name = st.text_input("Deck名 (階層可)", value=cur_data.get("deck_name", "病理学::12 環境と発癌"))
-    group_title = st.text_input("グループタイトル", value=cur_data.get("group_title", "環境と発癌"))
-    pdf_pass = st.text_input("PDFパスワード (空白可)", value=cur_data.get("password", ""), type="password")
+    st.selectbox(
+        "📂 講義プリセット呼び出し",
+        preset_names,
+        key="selected_preset_key",
+        on_change=on_preset_change
+    )
+
+    deck_name = st.text_input("Deck名 (階層可)", key="deck_name_val")
+    group_title = st.text_input("グループタイトル", key="group_title_val")
+    pdf_pass = st.text_input("PDFパスワード (空白可)", key="pdf_pass_val", type="password")
     
     st.markdown("講義フォルダ")
     col_bf1, col_bf2 = st.columns([3, 1])
@@ -130,19 +157,26 @@ with st.sidebar:
                 st.session_state.masked_pdf_val = os.path.join(chosen_bf, "講義 masked.pdf")
                 st.rerun()
     with col_bf1:
-        base_folder = st.text_input("講義フォルダ", value=st.session_state.base_folder_val, label_visibility="collapsed")
-        st.session_state.base_folder_val = base_folder
+        base_folder = st.text_input("講義フォルダ", key="base_folder_val", label_visibility="collapsed")
     
     if st.button("現在の設定をプリセット保存"):
         presets[deck_name] = {
-            "deck_name": deck_name, "group_title": group_title, 
-            "password": pdf_pass, "base_folder": base_folder
+            "deck_name": deck_name,
+            "group_title": group_title, 
+            "password": pdf_pass,
+            "base_folder": st.session_state.base_folder_val
         }
         save_presets(presets)
-        st.success("プリセットを保存しました")
+        st.success(f"プリセット '{deck_name}' を保存しました")
+        st.rerun()
 
     st.markdown("---")
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
+
+if "slide_idx" not in st.session_state:
+    st.session_state.slide_idx = 0
+if "custom_prompt_val" not in st.session_state:
+    st.session_state.custom_prompt_val = DEFAULT_PROMPT
 
 # 書き出し済み画像の確認
 b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
@@ -156,7 +190,7 @@ tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
     "4. 📦 Ankiパッケージ出力"
 ])
 
-# タブ 1: 抽出 (Skip可能 & ファイル選択ダイアログ対応)
+# タブ 1: 抽出
 with tab_extract:
     st.subheader("PDFファイルの指定とJPEG書き出し")
     if b_images:
@@ -208,7 +242,7 @@ with tab_extract:
             if st.button("📂 exported_jpgs フォルダをFinderで開く"):
                 subprocess.run(["open", os.path.abspath(DEST_DIR)])
 
-# タブ 2: AI一括強化 (試算・モデル選択・承認) ※元コード完全維持
+# タブ 2: AI一括強化
 with tab_ai_batch:
     st.subheader("Gemini Flash による一括スライドAI強化")
     unprocessed = [f for f in b_images if os.path.basename(f) not in ai_cache]
@@ -216,7 +250,6 @@ with tab_ai_batch:
     st.write(f"検出されたBack画像: **{len(b_images)} 枚**（うち未処理: **{len(unprocessed)} 枚**）")
 
     if unprocessed:
-        # トークン試算（長辺1600px制限: 入力約700、出力HTML約1200）
         in_tokens = len(unprocessed) * 700
         out_tokens = len(unprocessed) * 1200
 
@@ -258,16 +291,18 @@ with tab_ai_batch:
     else:
         st.success("すべてのスライドのAI解説が完了済みです。")
 
-# タブ 3: 個別確認・カスタム指示 (サムネイル選択・←→移動・プロンプト管理)
+# タブ 3: 個別確認 (幅200px固定サムネイル ＋ 4列グリッド ＋ 3行分の縦スクロールボックス)
 with tab_ai_inspect:
     st.subheader("個別スライドの確認・プロンプト再生成")
     if b_images:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
 
-        # 1. 低解像度サムネイル一覧でスライドを選択
-        with st.expander("🖼️ 低解像度サムネイルでスライドを選択", expanded=False):
-            cols_per_row = 6
+        st.markdown("##### 🖼️ スライド一覧（幅200px固定サムネイル・クリックで選択）")
+
+        # 高さを 380px (およそ3行分) に設定し、4列グリッドでコンパクトに配置
+        with st.container(height=380, border=True):
+            cols_per_row = 4
             for r_start in range(0, total_slides, cols_per_row):
                 cols = st.columns(cols_per_row)
                 for c_idx in range(cols_per_row):
@@ -275,35 +310,49 @@ with tab_ai_inspect:
                     if idx < total_slides:
                         p_img = b_images[idx]
                         p_fn = os.path.basename(p_img)
-                        mark = "✅" if p_fn in ai_cache else "⚪"
+                        has_ai = "✅" if p_fn in ai_cache else "⚪"
                         is_selected = (idx == st.session_state.slide_idx)
+                        b64_str = get_thumb_b64(p_img, width=200)
+                        
                         with cols[c_idx]:
-                            st.image(get_low_res_thumb(p_img), use_container_width=True)
-                            if st.button(f"{idx+1} {mark}", key=f"thumb_{idx}", type="primary" if is_selected else "secondary", use_container_width=True):
+                            # 選択中のカードを視覚的に強調
+                            border_color = "#2563eb" if is_selected else "#cbd5e1"
+                            bg_color = "#eff6ff" if is_selected else "#ffffff"
+                            
+                            st.markdown(
+                                f"""<div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
+                                unsafe_allow_html=True
+                            )
+                            # Markdown形式で画像を表示し、その下に小さく番号とステータスを表示
+                            st.markdown(f"![thumb](data:image/jpeg;base64,{b64_str})", unsafe_allow_html=True)
+                            btn_label = f"スライド {idx + 1} {has_ai}"
+                            if st.button(btn_label, key=f"slide_sel_{idx}", type="primary" if is_selected else "secondary", use_container_width=True):
                                 st.session_state.slide_idx = idx
                                 st.rerun()
+                                
+                            st.markdown("</div>", unsafe_allow_html=True)
 
-        # 2. ← → ボタンで移動
         nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
         with nav_1:
-            if st.button("← 前のスライド", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
+            if st.button("⬅️ 前のスライド", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
                 st.session_state.slide_idx -= 1
                 st.rerun()
         with nav_3:
-            if st.button("次のスライド →", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
+            if st.button("次のスライド ➡️", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
                 st.session_state.slide_idx += 1
                 st.rerun()
         with nav_2:
             target_img = b_images[st.session_state.slide_idx]
             fn = os.path.basename(target_img)
-            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>{st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
+
+        st.markdown("---")
 
         col_v1, col_v2 = st.columns([1, 1])
         with col_v1:
             st.image(target_img, caption=fn, use_container_width=True)
 
         with col_v2:
-            # 3. プロンプト管理（Default呼び出しボタン・最新5件・名前付き保存・text書き出し）
             p_store = get_prompt_store()
             menu_items = ["(保存済み / 最新5件から呼び出し)"]
             menu_map = {}
@@ -318,25 +367,37 @@ with tab_ai_inspect:
                 menu_items.append(label)
                 menu_map[label] = r_p
 
+            def on_menu_select():
+                sel = st.session_state.prompt_menu_sel
+                if sel in menu_map:
+                    st.session_state.custom_prompt_val = menu_map[sel]
+                    st.session_state.prompt_menu_sel = "(保存済み / 最新5件から呼び出し)"
+
+            def on_reset_default():
+                st.session_state.custom_prompt_val = DEFAULT_PROMPT
+
             pm_col1, pm_col2 = st.columns([2.5, 1])
             with pm_col1:
-                selected_menu = st.selectbox("プロンプト呼び出しメニュー", menu_items, label_visibility="collapsed")
-                if selected_menu != "(保存済み / 最新5件から呼び出し)":
-                    st.session_state.custom_prompt_val = menu_map[selected_menu]
-                    st.rerun()
+                st.selectbox(
+                    "プロンプト呼び出しメニュー",
+                    menu_items,
+                    key="prompt_menu_sel",
+                    on_change=on_menu_select,
+                    label_visibility="collapsed",
+                )
             with pm_col2:
-                if st.button("🔄 Defaultに戻す", use_container_width=True):
-                    st.session_state.custom_prompt_val = DEFAULT_PROMPT
-                    st.rerun()
+                st.button(
+                    "🔄 Defaultに戻す",
+                    on_click=on_reset_default,
+                    use_container_width=True,
+                )
 
             custom_prompt = st.text_area(
                 "プロンプト（初期値: 一括追加と同じDefaultプロンプト）",
-                value=st.session_state.custom_prompt_val,
+                key="custom_prompt_val",
                 height=120,
             )
-            st.session_state.custom_prompt_val = custom_prompt
 
-            # 名前をつけて保存 & text書き出し
             sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1])
             with sv_col1:
                 prompt_name = st.text_input("プロンプト保存名", placeholder="名前をつけて保存...", label_visibility="collapsed")
@@ -356,24 +417,153 @@ with tab_ai_inspect:
                     export_text += f"\n[Recent {i}]\n{v}\n"
                 st.download_button("📄 text書き出し", data=export_text, file_name="custom_prompts.txt", mime="text/plain", use_container_width=True)
 
-            sel_inspect_model = st.selectbox("使用モデル（個別）", [m["id"] for m in PRICING_MODELS.values()], index=2)
+            # --- 個別モデル選択 & 1枚あたりの推定費用表示 ---
+            model_labels = list(PRICING_MODELS.keys())
             
-            if st.button("このスライドのみ再生成", type="primary", disabled=not api_key):
+            # "Gemini 2.5 Flash" が含まれる項目を自動で初期選択 (デフォルト)
+            default_idx = 0
+            for idx, label in enumerate(model_labels):
+                if "2.5 Flash" in label:
+                    default_idx = idx
+                    break
+
+            gen_c1, gen_c2 = st.columns([1.6, 1])
+            with gen_c1:
+                sel_inspect_label = st.selectbox(
+                    "使用モデル（個別）",
+                    model_labels,
+                    index=default_idx,
+                    label_visibility="collapsed"
+                )
+            
+            # 選択されたモデルの単価情報からスライド1枚分（入力約700、出力約1200トークン）を試算
+            chosen_spec = PRICING_MODELS[sel_inspect_label]
+            sel_inspect_model = chosen_spec["id"]
+            
+            single_in_cost = (700 / 1_000_000) * chosen_spec["in"]
+            single_out_cost = (1200 / 1_000_000) * chosen_spec["out"]
+            single_cost_usd = single_in_cost + single_out_cost
+            single_cost_jpy = single_cost_usd * USD_JPY
+
+            with gen_c2:
+                # 1枚あたりの試算バッジ表示
+                st.caption(f"💰 1枚推定: **約 {single_cost_jpy:.3f} 円** (`${single_cost_usd:.4f}`)")
+
+            if st.button("✨ このスライドのみ再生成", type="primary", disabled=not api_key, use_container_width=True):
                 keep_recent_prompt(custom_prompt)
-                with st.spinner("AI解説を更新中..."):
+                with st.spinner(f"{fn} のAI解説を再生成中..."):
                     new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
                     ai_cache[fn] = new_html
                     save_ai_cache(ai_cache)
-                    st.success("更新しました。")
+                    st.success("更新しました！")
                     st.rerun()
 
+        # --- 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ) ---
         st.markdown("#### 現在のBack面AI解説プレビュー")
         if fn in ai_cache:
-            st.components.v1.html(f"<div class='ai-container'>{ai_cache[fn]}</div>", height=450, scrolling=True)
+            preview_style = f"""
+            <style>
+                html, body {{
+                    margin: 0;
+                    padding: 8px;
+                    background-color: #f1f5f9 !important; /* Ankiカード背景 */
+                    color: #1e293b !important;
+                    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Segoe UI", Roboto, sans-serif;
+                }}
+                .card-preview {{
+                    background: #ffffff !important;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                    padding: 18px;
+                    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.08);
+                    color: #1e293b !important;
+                }}
+                .ai-container {{
+                    margin-top: 0;
+                    text-align: left;
+                    font-size: 0.95em;
+                    line-height: 1.6;
+                    color: #1e293b !important;
+                }}
+                .ai-title {{
+                    background: #0b4f8c !important; /* 濃い青の帯 */
+                    color: #ffffff !important;       /* 文字を完全な白に強制 */
+                    font-size: 1.1em;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border-radius: 6px;
+                    margin-bottom: 14px;
+                    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+                }}
+                .ai-summary-box {{
+                    background: #fff4f4 !important;
+                    border-left: 4px solid #ff3b30 !important;
+                    padding: 8px 12px;
+                    margin-bottom: 14px;
+                    border-radius: 0 4px 4px 0;
+                    color: #222222 !important;
+                }}
+                .ai-summary-title {{
+                    color: #d70015 !important;
+                    font-weight: bold;
+                    margin-bottom: 2px;
+                }}
+                .ai-cascade-box {{
+                    background: #f6f8fa !important;
+                    border: 1px solid #e1e4e8 !important;
+                    border-radius: 6px;
+                    padding: 10px 14px;
+                    margin-top: 12px;
+                    color: #24292e !important;
+                }}
+                .ai-table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin: 10px 0;
+                    background: #ffffff !important;
+                    border-radius: 4px;
+                    overflow: hidden;
+                    box-shadow: 0 0 0 1px #d2e3f8;
+                    color: #1e293b !important;
+                }}
+                .ai-table th {{
+                    background: #e8f2fe !important;
+                    color: #1a4f8b !important;
+                    padding: 8px;
+                    text-align: left;
+                    border-bottom: 1px solid #c2dbf7;
+                    font-weight: bold;
+                }}
+                .ai-table td {{
+                    padding: 8px;
+                    border-bottom: 1px solid #edf2f9;
+                    border-right: 1px solid #edf2f9;
+                    vertical-align: top;
+                    color: #222222 !important;
+                }}
+                ul, ol {{
+                    margin: 8px 0;
+                    padding-left: 20px;
+                    color: #1e293b !important;
+                }}
+                li {{
+                    margin-bottom: 4px;
+                }}
+                b, strong {{
+                    color: #0f172a !important;
+                }}
+            </style>
+            <div class="card-preview">
+                <div class="ai-container">
+                    {ai_cache[fn]}
+                </div>
+            </div>
+            """
+            st.components.v1.html(preview_style, height=450, scrolling=True)
         else:
             st.info("このスライドにはまだAI解説がありません。")
 
-# タブ 4: Ankiパッケージ出力・クリーンアップ ※元コード完全維持
+# タブ 4: Ankiパッケージ出力
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
     st.write(f"出力先デッキ名: **{deck_name}**")
