@@ -26,6 +26,8 @@ def get_poppler_path():
 
 MAX_IMAGE_LENGTH = 1600  # トークン爆発防止のため長辺を1600pxに制限
 
+DEFAULT_PROMPT = "このスライドの内容を医学生向けに整理・解説してください。"
+
 SYSTEM_PROMPT = """
 あなたは医学部専門の基礎医学・臨床医学の講師です。
 提供された講義スライド画像を分析し、学生が復習・国試・定期試験で直感的に理解できる「最高品質の補足解説」をHTMLで作成してください。
@@ -96,7 +98,7 @@ def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password=""
 def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None):
     client = genai.Client(api_key=api_key)
     img = Image.open(img_path)
-    prompt = custom_prompt or "このスライドの内容を医学生向けに整理・解説してください。"
+    prompt = custom_prompt or DEFAULT_PROMPT
     
     response = client.models.generate_content(
         model=model_id,
