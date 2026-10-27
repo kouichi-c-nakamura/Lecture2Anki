@@ -184,9 +184,9 @@ ai_cache = get_ai_cache()
 
 # --- メインエリアのタブ構成 ---
 tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
-    "1. PDF抽出・Cloze準備", 
-    "2. 💰 AI解説の一括追加 (試算＆承認)", 
-    "3. 🔍 個別確認・カスタムプロンプト", 
+    "1. PDF指定", 
+    "2. 💰 AI解説の一括追加", 
+    "3. 🔍 個別AI解説", 
     "4. 📦 Ankiパッケージ出力"
 ])
 
