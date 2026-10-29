@@ -121,12 +121,12 @@ def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None):
     if text.endswith("```"): text = text[:-3]
     return text.strip()
 
-def build_apkg(dest_dir, deck_name, group_title, ai_cache=None):
+def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None):
     files = sorted(glob.glob(os.path.join(dest_dir, "*.jpg")))
     if not files:
         return "", 0
     
-    # フォルダ内に残っている中で最新のタイムスタンプのファイルだけに限定する
+    # フォルダ内に残っている中で最新のタイムスタンプのファイルだけに限定
     latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
     files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
     
@@ -167,13 +167,15 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None):
             ai_html = f'<div class="ai-container">{ai_body}</div>' if ai_body else ""
             back_html = f'<img src="{b_img}">{ai_html}'
 
-            # 決定論的GUID: デッキ名 + ページ識別キー
             guid = genanki.guid_for(f"{deck_name}_{data['page']}")
             note = genanki.Note(model=model, fields=[front_html, back_html], guid=guid)
             deck.add_note(note)
 
             media_list.extend([data['a'], data['b']])
 
-    out_apkg = f"{deck_name.replace('::', '_').replace('/', '_')}.apkg"
+    filename = f"{deck_name.replace('::', '_').replace('/', '_')}.apkg"
+    target_dir = output_dir if (output_dir and os.path.exists(output_dir)) else "."
+    out_apkg = os.path.join(target_dir, filename)
+
     genanki.Package(deck, media_files=media_list).write_to_file(out_apkg)
     return out_apkg, len(deck.notes)

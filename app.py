@@ -566,16 +566,30 @@ with tab_ai_inspect:
             st.info("このスライドにはまだAI解説がありません。")
 
 # タブ 4: Ankiパッケージ出力
+# タブ 4: Ankiパッケージ出力
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
     st.write(f"出力先デッキ名: **{deck_name}**")
+    
+    # 講義フォルダが設定されている場合はデフォルトの保存先にする
+    bf = st.session_state.get("base_folder_val", "").strip()
+    target_dir = bf if (bf and os.path.exists(bf)) else "."
+    display_dir = os.path.abspath(target_dir)
+    st.info(f"📁 出力先フォルダ: `{display_dir}`")
     
     col_out1, col_out2 = st.columns([1, 1])
     with col_out1:
         if st.button("📦 .apkg パッケージを作成", type="primary"):
             with st.spinner("パッケージング中..."):
-                apkg_name, count = build_apkg(DEST_DIR, deck_name, group_title, get_ai_cache())
-                st.success(f"完成: {count} 枚のカードを含む '{apkg_name}' を書き出しました！")
+                apkg_path, count = build_apkg(
+                    DEST_DIR, 
+                    deck_name, 
+                    group_title, 
+                    get_ai_cache(), 
+                    output_dir=target_dir
+                )
+                st.success(f"完成: {count} 枚のカードを含む '{os.path.basename(apkg_path)}' を保存しました！")
+                st.caption(f"保存場所: `{apkg_path}`")
                 st.info("※決定論的GUIDにより、Ankiに再インポートしても学習進捗を維持したまま上書きされます。")
 
     with col_out2:
