@@ -108,6 +108,7 @@ presets = get_presets()
 preset_names = ["(新規入力)"] + list(presets.keys())
 
 # 1. 初回起動時のセッションステート初期化（直近保存されたプリセットがあればそれをロード）
+# 1. 初回起動時のセッションステート初期化
 if "deck_name_val" not in st.session_state:
     initial_p = preset_names[1] if len(preset_names) > 1 else "(新規入力)"
     cur = presets.get(initial_p, {})
@@ -116,10 +117,12 @@ if "deck_name_val" not in st.session_state:
     st.session_state.pdf_pass_val = cur.get("password", "")
     bf = cur.get("base_folder", "")
     st.session_state.base_folder_val = bf
-    st.session_state.unmasked_pdf_val = os.path.join(bf, "講義.pdf") if bf else ""
-    st.session_state.masked_pdf_val = os.path.join(bf, "講義 masked.pdf") if bf else ""
+    # プリセットに明示的に保存されたパスがあればそれを使用し、なければ従来の default
+    st.session_state.unmasked_pdf_val = cur.get("unmasked_pdf") or (os.path.join(bf, "講義.pdf") if bf else "")
+    st.session_state.masked_pdf_val = cur.get("masked_pdf") or (os.path.join(bf, "講義 masked.pdf") if bf else "")
 
 # 2. プリセット変更時に実行されるコールバック（描画前に確実に代入される）
+# 2. プリセット変更時に実行されるコールバック
 def on_preset_change():
     sel = st.session_state.selected_preset_key
     if sel != "(新規入力)" and sel in presets:
@@ -129,8 +132,9 @@ def on_preset_change():
         st.session_state.pdf_pass_val = p_data.get("password", "")
         bf = p_data.get("base_folder", "")
         st.session_state.base_folder_val = bf
-        st.session_state.unmasked_pdf_val = os.path.join(bf, "講義.pdf") if bf else ""
-        st.session_state.masked_pdf_val = os.path.join(bf, "講義 masked.pdf") if bf else ""
+        # プリセットから個別パスを復元
+        st.session_state.unmasked_pdf_val = p_data.get("unmasked_pdf") or (os.path.join(bf, "講義.pdf") if bf else "")
+        st.session_state.masked_pdf_val = p_data.get("masked_pdf") or (os.path.join(bf, "講義 masked.pdf") if bf else "")
 
 with st.sidebar:
     st.header("講義・デッキ設定")
@@ -163,7 +167,9 @@ with st.sidebar:
             "deck_name": deck_name,
             "group_title": group_title, 
             "password": pdf_pass,
-            "base_folder": st.session_state.base_folder_val
+            "base_folder": st.session_state.base_folder_val,
+            "unmasked_pdf": st.session_state.get("unmasked_pdf_val", ""),
+            "masked_pdf": st.session_state.get("masked_pdf_val", "")
         }
         save_presets(presets)
         st.success(f"プリセット '{deck_name}' を保存しました")
