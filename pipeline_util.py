@@ -12,12 +12,16 @@ from google.genai import types
 
 def get_poppler_path():
     """環境に合わせて Poppler の実行バイナリパスを自動解決する"""
+    # 1. すでにシステム PATH が通っている場合 (Linux, CI, 一部のMac/Win)
     if shutil.which("pdftoppm"):
         return None
+    # 2. Apple Silicon Mac (Homebrew 標準)
     if os.path.exists("/opt/homebrew/bin/pdftoppm"):
         return "/opt/homebrew/bin"
+    # 3. Intel Mac (Homebrew 標準)
     if os.path.exists("/usr/local/bin/pdftoppm"):
         return "/usr/local/bin"
+    # 4. 見つからない場合は None (pdf2image 側の標準例外ハンドリングに任せる)
     return None
 
 MAX_IMAGE_LENGTH = 1600  # トークン爆発防止のため長辺を1600pxに制限
@@ -57,19 +61,6 @@ CARD_CSS = """
 .ai-table td { padding: 8px; border-bottom: 1px solid #edf2f9; border-right: 1px solid #edf2f9; vertical-align: top; }
 """
 
-def get_available_batches(dest_dir="exported_jpgs"):
-    """dest_dir 内のタイムスタンプ一覧を新しい順（降順）に取得し、それぞれの枚数を返す"""
-    if not os.path.exists(dest_dir):
-        return {}
-    pattern = re.compile(r'^(\d{4}-\d{2}-\d{2}_\d{6})_\d{3}b\.jpg$')
-    batches = {}
-    for f in os.listdir(dest_dir):
-        m = pattern.match(f)
-        if m:
-            ts = m.group(1)
-            batches[ts] = batches.get(ts, 0) + 1
-    return dict(sorted(batches.items(), key=lambda x: x[0], reverse=True))
-
 def parse_pages(page_str, total_pages):
     if not page_str or page_str.strip() == "all":
         return list(range(1, total_pages + 1))
@@ -85,7 +76,7 @@ def parse_pages(page_str, total_pages):
 
 def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password="", dpi=200, dest_dir="exported_jpgs"):
     os.makedirs(dest_dir, exist_ok=True)
-    poppler_bin = get_poppler_path()
+    poppler_bin = get_poppler_path()  # ここで動的取得
 
     info = pdfinfo_from_path(unmasked_pdf, poppler_path=poppler_bin, userpw=password)
     total_pages = info["Pages"]
@@ -130,26 +121,26 @@ def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None):
     if text.endswith("```"): text = text[:-3]
     return text.strip()
 
-def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, target_ts=None):
-    # target_ts が未指定の場合は最新バッチのみを自動選択（全件混ぜるのを防止）
-    if not target_ts:
-        batches = get_available_batches(dest_dir)
-        if not batches:
-            raise ValueError("対象のJPG画像が見つかりません。")
-        target_ts = next(iter(batches.keys()))
-
-    # 指定されたタイムスタンプのJPGのみを取得
-    files = sorted(glob.glob(os.path.join(dest_dir, f"{target_ts}_*.jpg")))
+def build_apkg(dest_dir, deck_name, group_title, ai_cache=None):
+    files = sorted(glob.glob(os.path.join(dest_dir, "*.jpg")))
+    if not files:
+        return "", 0
+    
+    # フォルダ内に残っている中で最新のタイムスタンプのファイルだけに限定する
+    latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
+    files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
+    
     pairs = {}
-    pattern = re.compile(rf'^({re.escape(target_ts)})_(\d{{3}})([ab])\.jpg$')
+    pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{6})_(\d{3})([ab])\.jpg')
 
     for f in files:
-        m = pattern.match(os.path.basename(f))
+        m = pattern.search(os.path.basename(f))
         if m:
+            key = f"{m.group(1)}_{m.group(2)}"
             page_num = m.group(2)
-            if page_num not in pairs:
-                pairs[page_num] = {"page": page_num}
-            pairs[page_num][m.group(3)] = f
+            if key not in pairs:
+                pairs[key] = {"page": page_num}
+            pairs[key][m.group(3)] = f
 
     model_id = abs(hash("Medical_Card_Model_V2")) % (10**9)
     deck_id = abs(hash(deck_name)) % (10**9)
@@ -164,7 +155,7 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, target_ts=None):
     deck = genanki.Deck(deck_id, deck_name)
     media_list = []
 
-    for page_num, data in sorted(pairs.items()):
+    for key, data in sorted(pairs.items()):
         if 'a' in data and 'b' in data:
             f_img = os.path.basename(data['a'])
             b_img = os.path.basename(data['b'])
