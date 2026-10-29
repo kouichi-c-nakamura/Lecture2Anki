@@ -13,6 +13,7 @@ from pipeline_util import (
     call_gemini_enhance,
     build_apkg,
     get_poppler_path,
+    get_available_batches,
     DEFAULT_PROMPT,
 )
 
@@ -31,8 +32,6 @@ CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
 
-# 公式ドキュメント (ai.google.dev/gemini-api/docs/pricing) 準拠の正確な料金 (USD / 1M tokens)
-# ※ 3.6 / 3.8 Flash は 2026年12月31日までの特別導入価格 ($0.75 / $3.75) を反映
 PRICING_MODELS = {
     "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
     "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
@@ -103,15 +102,15 @@ def get_thumb_b64(img_path, width=200):
 st.set_page_config(page_title="PDF to Anki + AI Enhancer", layout="wide")
 st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 
-# --- サイドバー: 講義設定と履歴 ---
 presets = get_presets()
 preset_names = ["(新規入力)"] + list(presets.keys())
+batches = get_available_batches(DEST_DIR)
 
-# 1. 初回起動時のセッションステート初期化（直近保存されたプリセットがあればそれをロード）
+# 1. 初回起動時のセッションステート初期化
 if "deck_name_val" not in st.session_state:
-    # プリセットが1件以上あれば先頭のものを初期値にする
     initial_p = preset_names[1] if len(preset_names) > 1 else "(新規入力)"
     cur = presets.get(initial_p, {})
+    st.session_state.selected_preset_key = initial_p
     st.session_state.deck_name_val = cur.get("deck_name", "病理学::12 環境と発癌")
     st.session_state.group_title_val = cur.get("group_title", "環境と発癌")
     st.session_state.pdf_pass_val = cur.get("password", "")
@@ -119,10 +118,13 @@ if "deck_name_val" not in st.session_state:
     st.session_state.base_folder_val = bf
     st.session_state.unmasked_pdf_val = os.path.join(bf, "講義.pdf") if bf else ""
     st.session_state.masked_pdf_val = os.path.join(bf, "講義 masked.pdf") if bf else ""
+    saved_ts = cur.get("last_ts", "")
+    st.session_state.active_ts = saved_ts if saved_ts in batches else ""
 
-# 2. プリセット変更時に実行されるコールバック（描画前に確実に代入される）
+# 2. プリセット変更時のコールバック
 def on_preset_change():
     sel = st.session_state.selected_preset_key
+    st.session_state.slide_idx = 0
     if sel != "(新規入力)" and sel in presets:
         p_data = presets[sel]
         st.session_state.deck_name_val = p_data.get("deck_name", "")
@@ -132,6 +134,11 @@ def on_preset_change():
         st.session_state.base_folder_val = bf
         st.session_state.unmasked_pdf_val = os.path.join(bf, "講義.pdf") if bf else ""
         st.session_state.masked_pdf_val = os.path.join(bf, "講義 masked.pdf") if bf else ""
+        saved_ts = p_data.get("last_ts", "")
+        st.session_state.active_ts = saved_ts if saved_ts in batches else ""
+    else:
+        # 新規入力時は過去のバッチを勝手に紐付けない
+        st.session_state.active_ts = ""
 
 with st.sidebar:
     st.header("講義・デッキ設定")
@@ -155,6 +162,8 @@ with st.sidebar:
                 st.session_state.base_folder_val = chosen_bf
                 st.session_state.unmasked_pdf_val = os.path.join(chosen_bf, "講義.pdf")
                 st.session_state.masked_pdf_val = os.path.join(chosen_bf, "講義 masked.pdf")
+                # 別のフォルダを選んだらバッチ選択を未抽出状態へリセット
+                st.session_state.active_ts = ""
                 st.rerun()
     with col_bf1:
         base_folder = st.text_input("講義フォルダ", key="base_folder_val", label_visibility="collapsed")
@@ -164,11 +173,33 @@ with st.sidebar:
             "deck_name": deck_name,
             "group_title": group_title, 
             "password": pdf_pass,
-            "base_folder": st.session_state.base_folder_val
+            "base_folder": st.session_state.base_folder_val,
+            "last_ts": st.session_state.get("active_ts", "")
         }
         save_presets(presets)
         st.success(f"プリセット '{deck_name}' を保存しました")
         st.rerun()
+
+    st.markdown("---")
+    # 対象タイムスタンプ（バッチ）の明示的選択
+    st.subheader("対象画像バッチ (Timestamp)")
+    batch_options = [""] + list(batches.keys())
+    
+    if st.session_state.get("active_ts") not in batch_options:
+        st.session_state.active_ts = ""
+
+    def format_batch(ts):
+        if not ts:
+            return "🆕 未選択（新規PDF抽出）"
+        return f"🕒 {ts} ({batches[ts]}枚)"
+
+    selected_ts = st.selectbox(
+        "処理対象の抽出バッチ",
+        options=batch_options,
+        format_func=format_batch,
+        key="active_ts",
+        help="過去と現在のJPGが混ざらないよう、ここで選択されたタイムスタンプの画像のみを処理します。"
+    )
 
     st.markdown("---")
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
@@ -178,8 +209,13 @@ if "slide_idx" not in st.session_state:
 if "custom_prompt_val" not in st.session_state:
     st.session_state.custom_prompt_val = DEFAULT_PROMPT
 
-# 書き出し済み画像の確認
-b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
+# 選択されているタイムスタンプの *b.jpg のみを取得（他講義のファイルを一切混ぜない）
+active_ts = st.session_state.get("active_ts", "")
+if active_ts:
+    b_images = sorted(glob.glob(os.path.join(DEST_DIR, f"{active_ts}_*b.jpg")))
+else:
+    b_images = []
+
 ai_cache = get_ai_cache()
 
 # --- メインエリアのタブ構成 ---
@@ -194,9 +230,11 @@ tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
 with tab_extract:
     st.subheader("PDFファイルの指定とJPEG書き出し")
     if b_images:
-        st.info(f"💡 すでに `{DEST_DIR}` に **{len(b_images)} 枚** のJPGが書き出されています。この工程をスキップしてタブ 2・タブ 3 へ進めます。")
+        st.info(f"💡 現在の対象バッチ `{active_ts}`（**{len(b_images)} 枚**）が選択されています。このままタブ 2・タブ 3 へ進めます。新しく抽出する場合は下のメニューを開いてください。")
+    elif batches:
+        st.caption(f"※ `{DEST_DIR}` には過去の抽出バッチが {len(batches)} 件ありますが、混入防止のため除外されています（再開する場合は左サイドバーの「処理対象の抽出バッチ」から選択できます）。")
 
-    with st.expander("PDFからJPEGを抽出する（未抽出または再抽出時のみ開く）", expanded=(len(b_images) == 0)):
+    with st.expander("PDFからJPEGを抽出する", expanded=(len(b_images) == 0)):
         mode = st.radio("Cloze準備の形式", ["事前Cloze済み (Masked PDFあり)", "事後Cloze作成 (Unmaskedのみから生成)"])
         
         st.markdown("講義資料PDF (Unmasked) パス")
@@ -235,72 +273,84 @@ with tab_extract:
                 else:
                     with st.spinner("PDFレンダリング中..."):
                         ts, cnt = extract_pdf_pages(unmasked_pdf, masked_pdf, pages_str, pdf_pass)
-                        st.success(f"完了: {cnt} ページ分の画像（a/bペア）を exported_jpgs に書き出しました。")
+                        # 抽出した最新タイムスタンプをアクティブに設定
+                        st.session_state.active_ts = ts
+                        st.session_state.slide_idx = 0
+                        # 登録済みプリセットであれば last_ts も自動更新
+                        if deck_name in presets:
+                            presets[deck_name]["last_ts"] = ts
+                            save_presets(presets)
+                        st.success(f"完了: バッチ `{ts}` として {cnt} ページ分の画像を書き出しました。")
                         st.rerun()
         
         with col_btn2:
             if st.button("📂 exported_jpgs フォルダをFinderで開く"):
+                os.makedirs(DEST_DIR, exist_ok=True)
                 subprocess.run(["open", os.path.abspath(DEST_DIR)])
 
 # タブ 2: AI一括強化
 with tab_ai_batch:
     st.subheader("Gemini Flash による一括スライドAI強化")
-    unprocessed = [f for f in b_images if os.path.basename(f) not in ai_cache]
-
-    st.write(f"検出されたBack画像: **{len(b_images)} 枚**（うち未処理: **{len(unprocessed)} 枚**）")
-
-    if unprocessed:
-        in_tokens = len(unprocessed) * 700
-        out_tokens = len(unprocessed) * 1200
-
-        st.markdown("#### モデル別 費用試算（未処理枚数分）")
-        calc_rows = []
-        for name, spec in PRICING_MODELS.items():
-            cost_usd = (in_tokens / 1_000_000 * spec["in"]) + (out_tokens / 1_000_000 * spec["out"])
-            cost_jpy = cost_usd * USD_JPY
-            calc_rows.append({
-                "モデル": name,
-                "全体費用 (JPY)": f"約 {cost_jpy:.2f} 円",
-                "1枚あたり": f"{(cost_jpy/len(unprocessed)):.3f} 円",
-                "USD換算": f"${cost_usd:.4f}"
-            })
-        st.table(calc_rows)
-
-        sel_model_name = st.selectbox("使用するモデル", list(PRICING_MODELS.keys()), index=2)
-        model_id = PRICING_MODELS[sel_model_name]["id"]
-
-        is_approved = st.checkbox("上記費用の試算を確認し、一括実行を承認します", value=False)
-        if st.button("🚀 承認して一括AI解説を生成", type="primary", disabled=not (is_approved and api_key)):
-            pbar = st.progress(0)
-            status_box = st.empty()
-            
-            for idx, img_path in enumerate(unprocessed):
-                fn = os.path.basename(img_path)
-                status_box.text(f"解説作成中 ({idx+1}/{len(unprocessed)}): {fn}")
-                try:
-                    html_text = call_gemini_enhance(img_path, api_key, model_id)
-                    ai_cache[fn] = html_text
-                    save_ai_cache(ai_cache)
-                except Exception as e:
-                    st.error(f"{fn} でAPIエラー発生: {e}")
-                    break
-                pbar.progress((idx + 1) / len(unprocessed))
-            
-            status_box.success("一括生成が完了しました！")
-            st.rerun()
+    if not b_images:
+        st.warning("対象のスライド画像がありません。タブ1でPDFからJPEGを抽出するか、サイドバーから対象バッチを選択してください。")
     else:
-        st.success("すべてのスライドのAI解説が完了済みです。")
+        unprocessed = [f for f in b_images if os.path.basename(f) not in ai_cache]
 
-# タブ 3: 個別確認 (幅200px固定サムネイル ＋ 4列グリッド ＋ 3行分の縦スクロールボックス)
+        st.write(f"対象バッチ: `{active_ts}` ｜ 検出されたBack画像: **{len(b_images)} 枚**（うち未処理: **{len(unprocessed)} 枚**）")
+
+        if unprocessed:
+            in_tokens = len(unprocessed) * 700
+            out_tokens = len(unprocessed) * 1200
+
+            st.markdown("#### モデル別 費用試算（未処理枚数分）")
+            calc_rows = []
+            for name, spec in PRICING_MODELS.items():
+                cost_usd = (in_tokens / 1_000_000 * spec["in"]) + (out_tokens / 1_000_000 * spec["out"])
+                cost_jpy = cost_usd * USD_JPY
+                calc_rows.append({
+                    "モデル": name,
+                    "全体費用 (JPY)": f"約 {cost_jpy:.2f} 円",
+                    "1枚あたり": f"{(cost_jpy/len(unprocessed)):.3f} 円",
+                    "USD換算": f"${cost_usd:.4f}"
+                })
+            st.table(calc_rows)
+
+            sel_model_name = st.selectbox("使用するモデル", list(PRICING_MODELS.keys()), index=2)
+            model_id = PRICING_MODELS[sel_model_name]["id"]
+
+            is_approved = st.checkbox("上記費用の試算を確認し、一括実行を承認します", value=False)
+            if st.button("🚀 承認して一括AI解説を生成", type="primary", disabled=not (is_approved and api_key)):
+                pbar = st.progress(0)
+                status_box = st.empty()
+                
+                for idx, img_path in enumerate(unprocessed):
+                    fn = os.path.basename(img_path)
+                    status_box.text(f"解説作成中 ({idx+1}/{len(unprocessed)}): {fn}")
+                    try:
+                        html_text = call_gemini_enhance(img_path, api_key, model_id)
+                        ai_cache[fn] = html_text
+                        save_ai_cache(ai_cache)
+                    except Exception as e:
+                        st.error(f"{fn} でAPIエラー発生: {e}")
+                        break
+                    pbar.progress((idx + 1) / len(unprocessed))
+                
+                status_box.success("一括生成が完了しました！")
+                st.rerun()
+        else:
+            st.success("このバッチのすべてのスライドのAI解説が完了済みです。")
+
+# タブ 3: 個別確認
 with tab_ai_inspect:
     st.subheader("個別スライドの確認・プロンプト再生成")
-    if b_images:
+    if not b_images:
+        st.warning("対象のスライド画像がありません。タブ1でPDFからJPEGを抽出するか、サイドバーから対象バッチを選択してください。")
+    else:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
 
-        st.markdown("##### 🖼️ スライド一覧（幅200px固定サムネイル・クリックで選択）")
+        st.markdown(f"##### 🖼️ スライド一覧（バッチ `{active_ts}` : 全 {total_slides} 枚）")
 
-        # 高さを 380px (およそ3行分) に設定し、4列グリッドでコンパクトに配置
         with st.container(height=380, border=True):
             cols_per_row = 4
             for r_start in range(0, total_slides, cols_per_row):
@@ -315,7 +365,6 @@ with tab_ai_inspect:
                         b64_str = get_thumb_b64(p_img, width=200)
                         
                         with cols[c_idx]:
-                            # 選択中のカードを視覚的に強調
                             border_color = "#2563eb" if is_selected else "#cbd5e1"
                             bg_color = "#eff6ff" if is_selected else "#ffffff"
                             
@@ -323,7 +372,6 @@ with tab_ai_inspect:
                                 f"""<div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
                                 unsafe_allow_html=True
                             )
-                            # Markdown形式で画像を表示し、その下に小さく番号とステータスを表示
                             st.markdown(f"![thumb](data:image/jpeg;base64,{b64_str})", unsafe_allow_html=True)
                             btn_label = f"スライド {idx + 1} {has_ai}"
                             if st.button(btn_label, key=f"slide_sel_{idx}", type="primary" if is_selected else "secondary", use_container_width=True):
@@ -417,10 +465,7 @@ with tab_ai_inspect:
                     export_text += f"\n[Recent {i}]\n{v}\n"
                 st.download_button("📄 text書き出し", data=export_text, file_name="custom_prompts.txt", mime="text/plain", use_container_width=True)
 
-            # --- 個別モデル選択 & 1枚あたりの推定費用表示 ---
             model_labels = list(PRICING_MODELS.keys())
-            
-            # "Gemini 2.5 Flash" が含まれる項目を自動で初期選択 (デフォルト)
             default_idx = 0
             for idx, label in enumerate(model_labels):
                 if "2.5 Flash" in label:
@@ -436,7 +481,6 @@ with tab_ai_inspect:
                     label_visibility="collapsed"
                 )
             
-            # 選択されたモデルの単価情報からスライド1枚分（入力約700、出力約1200トークン）を試算
             chosen_spec = PRICING_MODELS[sel_inspect_label]
             sel_inspect_model = chosen_spec["id"]
             
@@ -446,7 +490,6 @@ with tab_ai_inspect:
             single_cost_jpy = single_cost_usd * USD_JPY
 
             with gen_c2:
-                # 1枚あたりの試算バッジ表示
                 st.caption(f"💰 1枚推定: **約 {single_cost_jpy:.3f} 円** (`${single_cost_usd:.4f}`)")
 
             if st.button("✨ このスライドのみ再生成", type="primary", disabled=not api_key, use_container_width=True):
@@ -458,7 +501,6 @@ with tab_ai_inspect:
                     st.success("更新しました！")
                     st.rerun()
 
-        # --- 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ) ---
         st.markdown("#### 現在のBack面AI解説プレビュー")
         if fn in ai_cache:
             preview_style = f"""
@@ -466,7 +508,7 @@ with tab_ai_inspect:
                 html, body {{
                     margin: 0;
                     padding: 8px;
-                    background-color: #f1f5f9 !important; /* Ankiカード背景 */
+                    background-color: #f1f5f9 !important;
                     color: #1e293b !important;
                     font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Segoe UI", Roboto, sans-serif;
                 }}
@@ -486,8 +528,8 @@ with tab_ai_inspect:
                     color: #1e293b !important;
                 }}
                 .ai-title {{
-                    background: #0b4f8c !important; /* 濃い青の帯 */
-                    color: #ffffff !important;       /* 文字を完全な白に強制 */
+                    background: #0b4f8c !important;
+                    color: #ffffff !important;
                     font-size: 1.1em;
                     font-weight: bold;
                     padding: 8px 12px;
@@ -567,18 +609,21 @@ with tab_ai_inspect:
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
     st.write(f"出力先デッキ名: **{deck_name}**")
+    st.write(f"対象バッチ: **`{active_ts if active_ts else '未選択'}`** ({len(b_images)} 枚)")
     
     col_out1, col_out2 = st.columns([1, 1])
     with col_out1:
-        if st.button("📦 .apkg パッケージを作成", type="primary"):
+        if st.button("📦 .apkg パッケージを作成", type="primary", disabled=(not active_ts or len(b_images) == 0)):
             with st.spinner("パッケージング中..."):
-                apkg_name, count = build_apkg(DEST_DIR, deck_name, group_title, get_ai_cache())
-                st.success(f"完成: {count} 枚のカードを含む '{apkg_name}' を書き出しました！")
+                apkg_name, count = build_apkg(DEST_DIR, deck_name, group_title, get_ai_cache(), target_ts=active_ts)
+                st.success(f"完成: バッチ `{active_ts}` の {count} 枚のカードを含む '{apkg_name}' を書き出しました！")
                 st.info("※決定論的GUIDにより、Ankiに再インポートしても学習進捗を維持したまま上書きされます。")
 
     with col_out2:
-        if st.button("🗑️ 中間JPEG画像フォルダを全削除 (クリーンアップ)"):
-            all_jpgs = glob.glob(os.path.join(DEST_DIR, "*.jpg"))
-            for f in all_jpgs:
+        if st.button("🗑️ このバッチのJPEGのみ削除", disabled=not active_ts):
+            target_jpgs = glob.glob(os.path.join(DEST_DIR, f"{active_ts}_*.jpg"))
+            for f in target_jpgs:
                 os.remove(f)
-            st.success(f"{len(all_jpgs)} 枚のJPEGを削除しました。")
+            st.session_state.active_ts = ""
+            st.success(f"バッチ `{active_ts}` のJPEG ({len(target_jpgs)} 枚) を削除しました。")
+            st.rerun()
