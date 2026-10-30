@@ -129,4 +129,9 @@ Gemini API の画像トークン削減のため、長辺1600pxに自動最適化
 [MIT License](https://www.google.com/search?q=LICENSE)
 
 
+# TODO
 
+## UseCases
+- [ ] Replace/Update the jpegs for specific subset of the pages
+- [ ] Multiple pages selection for individual AI enhancement
+- [ ] Add AI enhancements to a subset of existing Anki notes while maintaining GUID

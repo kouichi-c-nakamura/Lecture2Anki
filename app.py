@@ -31,8 +31,6 @@ CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
 
-# 公式ドキュメント (ai.google.dev/gemini-api/docs/pricing) 準拠の正確な料金 (USD / 1M tokens)
-# ※ 3.6 / 3.8 Flash は 2026年12月31日までの特別導入価格 ($0.75 / $3.75) を反映
 PRICING_MODELS = {
     "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
     "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
@@ -55,6 +53,17 @@ def get_ai_cache():
 def save_ai_cache(data):
     os.makedirs(DEST_DIR, exist_ok=True)
     json.dump(data, open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+# --- 画像をmacOSクリップボードへコピーするヘルパー ---
+def copy_image_to_clipboard_macos(image_path):
+    abs_path = os.path.abspath(image_path)
+    osa = f'''
+    set theFile to POSIX file "{abs_path}"
+    set theImage to read theFile as «class PNG »
+    set the clipboard to theImage
+    '''
+    res = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
+    return res.returncode == 0
 
 # --- カスタムプロンプト保存・最新5件キープ用ヘルパー ---
 def get_prompt_store():
@@ -107,7 +116,6 @@ st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 presets = get_presets()
 preset_names = ["(新規入力)"] + list(presets.keys())
 
-# 1. 初回起動時のセッションステート初期化（直近保存されたプリセットがあればそれをロード）
 # 1. 初回起動時のセッションステート初期化
 if "deck_name_val" not in st.session_state:
     initial_p = preset_names[1] if len(preset_names) > 1 else "(新規入力)"
@@ -117,11 +125,9 @@ if "deck_name_val" not in st.session_state:
     st.session_state.pdf_pass_val = cur.get("password", "")
     bf = cur.get("base_folder", "")
     st.session_state.base_folder_val = bf
-    # プリセットに明示的に保存されたパスがあればそれを使用し、なければ従来の default
     st.session_state.unmasked_pdf_val = cur.get("unmasked_pdf") or (os.path.join(bf, "講義.pdf") if bf else "")
     st.session_state.masked_pdf_val = cur.get("masked_pdf") or (os.path.join(bf, "講義 masked.pdf") if bf else "")
 
-# 2. プリセット変更時に実行されるコールバック（描画前に確実に代入される）
 # 2. プリセット変更時に実行されるコールバック
 def on_preset_change():
     sel = st.session_state.selected_preset_key
@@ -132,7 +138,6 @@ def on_preset_change():
         st.session_state.pdf_pass_val = p_data.get("password", "")
         bf = p_data.get("base_folder", "")
         st.session_state.base_folder_val = bf
-        # プリセットから個別パスを復元
         st.session_state.unmasked_pdf_val = p_data.get("unmasked_pdf") or (os.path.join(bf, "講義.pdf") if bf else "")
         st.session_state.masked_pdf_val = p_data.get("masked_pdf") or (os.path.join(bf, "講義 masked.pdf") if bf else "")
 
@@ -183,11 +188,9 @@ if "slide_idx" not in st.session_state:
 if "custom_prompt_val" not in st.session_state:
     st.session_state.custom_prompt_val = DEFAULT_PROMPT
 
-# 書き出し済み画像の確認
-# 書き出し済み画像の確認（最新のタイムスタンプのバッチのみを自動抽出）
+# 最新のタイムスタンプのバッチのみを自動抽出
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
 if all_b_images:
-    # タイムスタンプ（ファイル名先頭17文字: YYYY-MM-DD_HHMMSS）で最新のものを特定
     latest_ts = sorted({os.path.basename(f)[:17] for f in all_b_images})[-1]
     b_images = [f for f in all_b_images if os.path.basename(f).startswith(latest_ts)]
 else:
@@ -203,7 +206,7 @@ tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
     "4. 📦 Ankiパッケージ出力"
 ])
 
-# タブ 1: 抽出（不要なスキップ案内と自動折りたたみを廃止し、常時フォームを表示）
+# タブ 1: 抽出
 with tab_extract:
     st.subheader("PDFファイルの指定とJPEG書き出し")
 
@@ -222,8 +225,9 @@ with tab_extract:
         st.session_state.unmasked_pdf_val = unmasked_pdf
 
     masked_pdf = None
+    is_masked_valid = True
     if mode == "事前Cloze済み (Masked PDFあり)":
-        st.markdown("マスク済みPDF (Masked) パス")
+        st.markdown("マスク済みPDF (Masked) パス <span style='color:#ef4444; font-size:12px;'>※ファイル名に 'masked' が必須</span>", unsafe_allow_html=True)
         col_m1, col_m2 = st.columns([5, 1])
         with col_m2:
             if st.button("📄 選択...", key="btn_choose_masked"):
@@ -235,16 +239,31 @@ with tab_extract:
             masked_pdf = st.text_input("マスク済みPDF (Masked) パス", value=st.session_state.masked_pdf_val, label_visibility="collapsed")
             st.session_state.masked_pdf_val = masked_pdf
 
+        # --- Masked PDF バリデーション ---
+        masked_fn = os.path.basename(masked_pdf.strip()) if masked_pdf else ""
+        if not masked_pdf or not masked_pdf.strip():
+            st.warning("⚠️ 事前Clozeモードでは Masked PDF の指定が必須です。")
+            is_masked_valid = False
+        elif not os.path.exists(masked_pdf):
+            st.error(f"⚠️ 指定された Masked PDF が見つかりません: `{masked_pdf}`")
+            is_masked_valid = False
+        elif "masked" not in masked_fn.lower():
+            st.error(f"⚠️ **無効なファイル名**: 事前Cloze用のPDF名には必ず `masked` を含める必要があります (指定名: `{masked_fn}`)")
+            is_masked_valid = False
+
     pages_str = st.text_input("対象ページ (例: 1-10, 14, 25 または all)", value="all")
 
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
-        if st.button("🖼️ JPEG画像を抽出・生成", type="primary"):
-            if not os.path.exists(unmasked_pdf):
+        btn_extract = st.button("🖼️ JPEG画像を抽出・生成", type="primary")
+        if btn_extract:
+            if not unmasked_pdf or not os.path.exists(unmasked_pdf):
                 st.error("Unmasked PDFが見つかりません。")
+            elif mode == "事前Cloze済み (Masked PDFあり)" and not is_masked_valid:
+                st.error("Masked PDF のバリデーションエラーを解消してください。")
             else:
                 with st.spinner("PDFレンダリング中..."):
-                    ts, cnt = extract_pdf_pages(unmasked_pdf, masked_pdf, pages_str, pdf_pass)
+                    ts, cnt = extract_pdf_pages(unmasked_pdf, masked_pdf if mode == "事前Cloze済み (Masked PDFあり)" else None, pages_str, pdf_pass)
                     st.success(f"完了: {cnt} ページ分の画像（a/bペア）を exported_jpgs に書き出しました。")
                     st.rerun()
     
@@ -302,9 +321,9 @@ with tab_ai_batch:
     else:
         st.success("すべてのスライドのAI解説が完了済みです。")
 
-# タブ 3: 個別確認 (幅200px固定サムネイル ＋ 4列グリッド ＋ 3行分の縦スクロールボックス)
+# タブ 3: 個別確認
 with tab_ai_inspect:
-    st.subheader("個別スライドの確認・プロンプト再生成")
+    st.subheader("個別スライドの確認・プロンプト再生成 & 手動編集")
     if b_images:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
@@ -359,6 +378,13 @@ with tab_ai_inspect:
         col_v1, col_v2 = st.columns([1, 1])
         with col_v1:
             st.image(target_img, caption=fn, use_container_width=True)
+            
+            # --- 画像クリップボードコピー用ボタン (外部LLM利用向け) ---
+            if st.button("📋 画像をクリップボードにコピー (for ChatGPT / Claude)", use_container_width=True):
+                if copy_image_to_clipboard_macos(target_img):
+                    st.toast("✅ 画像をクリップボードにコピーしました！外部チャットにそのまま貼り付け可能です。")
+                else:
+                    st.error("クリップボードへのコピーに失敗しました（macOS限定機能です）。")
 
         with col_v2:
             p_store = get_prompt_store()
@@ -403,9 +429,10 @@ with tab_ai_inspect:
             custom_prompt = st.text_area(
                 "プロンプト（初期値: 一括追加と同じDefaultプロンプト）",
                 key="custom_prompt_val",
-                height=120,
+                height=110,
             )
 
+            # --- プロンプトのクリップボードコピー & プリセット保存行 ---
             sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1])
             with sv_col1:
                 prompt_name = st.text_input("プロンプト保存名", placeholder="名前をつけて保存...", label_visibility="collapsed")
@@ -417,14 +444,17 @@ with tab_ai_inspect:
                         st.success(f"'{prompt_name}' を保存しました")
                         st.rerun()
             with sv_col3:
-                export_text = f"=== Current Prompt ===\n{custom_prompt}\n\n=== Saved Prompts ===\n"
-                for k, v in p_store.get("saved", {}).items():
-                    export_text += f"\n[{k}]\n{v}\n"
-                export_text += "\n=== Recent 5 Prompts ===\n"
-                for i, v in enumerate(p_store.get("recent", []), 1):
-                    export_text += f"\n[Recent {i}]\n{v}\n"
-                st.download_button("📄 text書き出し", data=export_text, file_name="custom_prompts.txt", mime="text/plain", use_container_width=True)
+                # ブラウザClipboard APIを利用したプロンプトコピーボタン
+                prompt_js = json.dumps(custom_prompt)
+                copy_btn_html = f"""
+                <button onclick='navigator.clipboard.writeText({prompt_js}); alert("プロンプトをクリップボードにコピーしました！");' 
+                        style="width: 100%; height: 38px; background-color: #f1f5f9; color: #1e293b; border: 1px solid #cbd5e1; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;">
+                    📋 Promptコピー
+                </button>
+                """
+                st.components.v1.html(copy_btn_html, height=45)
 
+            # --- モデル選択 & API再生成 ---
             model_labels = list(PRICING_MODELS.keys())
             default_idx = 0
             for idx, label in enumerate(model_labels):
@@ -452,7 +482,7 @@ with tab_ai_inspect:
             with gen_c2:
                 st.caption(f"💰 1枚推定: **約 {single_cost_jpy:.3f} 円** (`${single_cost_usd:.4f}`)")
 
-            if st.button("✨ このスライドのみ再生成", type="primary", disabled=not api_key, use_container_width=True):
+            if st.button("✨ このスライドのみAPI再生成 (Gemini)", type="primary", disabled=not api_key, use_container_width=True):
                 keep_recent_prompt(custom_prompt)
                 with st.spinner(f"{fn} のAI解説を再生成中..."):
                     new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
@@ -461,7 +491,44 @@ with tab_ai_inspect:
                     st.success("更新しました！")
                     st.rerun()
 
-        st.markdown("#### 現在のBack面AI解説プレビュー")
+        # --- HTML出力の編集・手動貼り付け用エリア（LLM App連携） ---
+        st.markdown("---")
+        st.markdown("#### 📝 AI解説HTMLの直接編集・貼り付け (ChatGPT/Claudeなどの結果を反映)")
+        current_html = ai_cache.get(fn, "")
+
+        with st.container(border=True):
+            edit_col1, edit_col2 = st.columns([4, 1])
+            with edit_col1:
+                edited_html = st.text_area(
+                    "解説HTMLコード (直接入力または貼り付け)",
+                    value=current_html,
+                    key=f"edit_html_{fn}",
+                    height=180,
+                    help="外部LLM（ChatGPT, Claude等）で作成したHTMLを貼り付けて保存できます。"
+                )
+            with edit_col2:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if st.button("💾 HTMLを手動保存", type="primary", use_container_width=True):
+                    clean_text = edited_html.strip()
+                    if clean_text.startswith("```html"): clean_text = clean_text[7:]
+                    if clean_text.startswith("```"): clean_text = clean_text[3:]
+                    if clean_text.endswith("```"): clean_text = clean_text[:-3]
+                    clean_text = clean_text.strip()
+                    
+                    ai_cache[fn] = clean_text
+                    save_ai_cache(ai_cache)
+                    st.success("HTML解説を保存しました！")
+                    st.rerun()
+                
+                if fn in ai_cache:
+                    if st.button("🗑️ この解説を消去", use_container_width=True):
+                        del ai_cache[fn]
+                        save_ai_cache(ai_cache)
+                        st.info("AI解説を消去しました。")
+                        st.rerun()
+
+        # --- 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ) ---
+        st.markdown("#### プレビュー (Anki Back面)")
         if fn in ai_cache:
             preview_style = f"""
             <style>
@@ -563,9 +630,8 @@ with tab_ai_inspect:
             """
             st.components.v1.html(preview_style, height=450, scrolling=True)
         else:
-            st.info("このスライドにはまだAI解説がありません。")
+            st.info("このスライドにはまだAI解説がありません。上のテキストエリアから手動入力するか、APIで生成してください。")
 
-# タブ 4: Ankiパッケージ出力
 # タブ 4: Ankiパッケージ出力
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
