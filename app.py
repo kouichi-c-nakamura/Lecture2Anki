@@ -26,7 +26,9 @@ if not shutil.which("pdftoppm") and get_poppler_path() is None:
     """)
 
 load_dotenv()
-CONFIG_FILE = "lecture_presets.json"
+LAST_STATE_FILE = ".last_lecture_folder.json"
+LEGACY_PRESETS_FILE = "lecture_presets.json"
+FOLDER_CONFIG_FILENAME = "lecture_config.json"
 CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
@@ -41,11 +43,101 @@ PRICING_MODELS = {
 }
 USD_JPY = 155.0
 
-def get_presets():
-    return json.load(open(CONFIG_FILE, "r", encoding="utf-8")) if os.path.exists(CONFIG_FILE) else {}
 
-def save_presets(data):
-    json.dump(data, open(CONFIG_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+# --- 講義フォルダ単位の設定ロード・保存ヘルパー (Exam2Anki方式) ---
+def get_last_folder():
+    if os.path.exists(LAST_STATE_FILE):
+        try:
+            data = json.load(open(LAST_STATE_FILE, "r", encoding="utf-8"))
+            bf = data.get("last_base_folder", "")
+            if bf and os.path.exists(bf):
+                return bf
+        except Exception:
+            pass
+    # 旧プリセットファイルがあれば先頭のフォルダを引き継ぐ
+    if os.path.exists(LEGACY_PRESETS_FILE):
+        try:
+            presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
+            for v in presets.values():
+                bf = v.get("base_folder", "")
+                if bf and os.path.exists(bf):
+                    return bf
+        except Exception:
+            pass
+    return ""
+
+def save_last_folder(folder_path):
+    try:
+        json.dump({"last_base_folder": folder_path}, open(LAST_STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def auto_detect_pdfs(folder_path):
+    """フォルダ内のPDFから unmasked / masked を自動推測する"""
+    if not folder_path or not os.path.isdir(folder_path):
+        return "", ""
+    pdfs = sorted(glob.glob(os.path.join(folder_path, "*.pdf")))
+    masked = [p for p in pdfs if "masked" in os.path.basename(p).lower()]
+    unmasked = [p for p in pdfs if "masked" not in os.path.basename(p).lower()]
+    
+    u_path = unmasked[0] if unmasked else os.path.join(folder_path, "講義.pdf")
+    m_path = masked[0] if masked else os.path.join(folder_path, "講義 masked.pdf")
+    return u_path, m_path
+
+def load_folder_config(folder_path):
+    """指定フォルダ内の lecture_config.json を読み込む。無ければ旧プリセットや自動検出で補完"""
+    if not folder_path:
+        return {}
+    cfg_path = os.path.join(folder_path, FOLDER_CONFIG_FILENAME)
+    if os.path.exists(cfg_path):
+        try:
+            return json.load(open(cfg_path, "r", encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 旧 lecture_presets.json に同じ base_folder の設定があればマイグレーション利用
+    if os.path.exists(LEGACY_PRESETS_FILE):
+        try:
+            presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
+            for v in presets.values():
+                if v.get("base_folder") == folder_path:
+                    return v
+        except Exception:
+            pass
+
+    # 新規フォルダの場合はフォルダ名と内部PDFから初期値を推測
+    folder_name = os.path.basename(folder_path.rstrip("/"))
+    u_pdf, m_pdf = auto_detect_pdfs(folder_path)
+    return {
+        "deck_name": folder_name,
+        "group_title": folder_name,
+        "password": "",
+        "base_folder": folder_path,
+        "unmasked_pdf": u_pdf,
+        "masked_pdf": m_pdf,
+    }
+
+def save_folder_config(folder_path, config_data):
+    """講義フォルダ直下に lecture_config.json を保存する"""
+    if not folder_path or not os.path.isdir(folder_path):
+        return False
+    cfg_path = os.path.join(folder_path, FOLDER_CONFIG_FILENAME)
+    json.dump(config_data, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    save_last_folder(folder_path)
+    return True
+
+def apply_folder_to_state(folder_path):
+    """フォルダ切り替え時に Session State 一式を更新する"""
+    st.session_state.base_folder_val = folder_path
+    cfg = load_folder_config(folder_path)
+    u_default, m_default = auto_detect_pdfs(folder_path)
+    st.session_state.deck_name_val = cfg.get("deck_name", "")
+    st.session_state.group_title_val = cfg.get("group_title", "")
+    st.session_state.pdf_pass_val = cfg.get("password", "")
+    st.session_state.unmasked_pdf_val = cfg.get("unmasked_pdf") or u_default
+    st.session_state.masked_pdf_val = cfg.get("masked_pdf") or m_default
+    save_last_folder(folder_path)
+
 
 def get_ai_cache():
     return json.load(open(CACHE_FILE, "r", encoding="utf-8")) if os.path.exists(CACHE_FILE) else {}
@@ -112,73 +204,75 @@ def get_thumb_b64(img_path, width=200):
 st.set_page_config(page_title="PDF to Anki + AI Enhancer", layout="wide")
 st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 
-# --- サイドバー: 講義設定と履歴 ---
-presets = get_presets()
-preset_names = ["(新規入力)"] + list(presets.keys())
+# --- 初回起動時のセッションステート初期化（最後に使ったフォルダの設定を自動ロード） ---
+if "base_folder_val" not in st.session_state:
+    init_bf = get_last_folder()
+    if init_bf:
+        apply_folder_to_state(init_bf)
+    else:
+        st.session_state.base_folder_val = ""
+        st.session_state.deck_name_val = ""
+        st.session_state.group_title_val = ""
+        st.session_state.pdf_pass_val = ""
+        st.session_state.unmasked_pdf_val = ""
+        st.session_state.masked_pdf_val = ""
 
-# 1. 初回起動時のセッションステート初期化
-if "deck_name_val" not in st.session_state:
-    initial_p = preset_names[1] if len(preset_names) > 1 else "(新規入力)"
-    cur = presets.get(initial_p, {})
-    st.session_state.deck_name_val = cur.get("deck_name", "病理学::12 環境と発癌")
-    st.session_state.group_title_val = cur.get("group_title", "環境と発癌")
-    st.session_state.pdf_pass_val = cur.get("password", "")
-    bf = cur.get("base_folder", "")
-    st.session_state.base_folder_val = bf
-    st.session_state.unmasked_pdf_val = cur.get("unmasked_pdf") or (os.path.join(bf, "講義.pdf") if bf else "")
-    st.session_state.masked_pdf_val = cur.get("masked_pdf") or (os.path.join(bf, "講義 masked.pdf") if bf else "")
+def on_base_folder_input_change():
+    bf = st.session_state.base_folder_val.strip().rstrip("/")
+    if bf and os.path.isdir(bf):
+        apply_folder_to_state(bf)
 
-# 2. プリセット変更時に実行されるコールバック
-def on_preset_change():
-    sel = st.session_state.selected_preset_key
-    if sel != "(新規入力)" and sel in presets:
-        p_data = presets[sel]
-        st.session_state.deck_name_val = p_data.get("deck_name", "")
-        st.session_state.group_title_val = p_data.get("group_title", "")
-        st.session_state.pdf_pass_val = p_data.get("password", "")
-        bf = p_data.get("base_folder", "")
-        st.session_state.base_folder_val = bf
-        st.session_state.unmasked_pdf_val = p_data.get("unmasked_pdf") or (os.path.join(bf, "講義.pdf") if bf else "")
-        st.session_state.masked_pdf_val = p_data.get("masked_pdf") or (os.path.join(bf, "講義 masked.pdf") if bf else "")
-
+# --- サイドバー: フォルダ起点の設定管理 (Exam2Anki方式) ---
 with st.sidebar:
-    st.header("講義・デッキ設定")
-    st.selectbox(
-        "📂 講義プリセット呼び出し",
-        preset_names,
-        key="selected_preset_key",
-        on_change=on_preset_change
-    )
+    st.header("講義フォルダ・デッキ設定")
+    
+    st.markdown("**📂 講義フォルダ (最優先・自動読込)**")
+    col_bf1, col_bf2 = st.columns([3.2, 1])
+    with col_bf2:
+        if st.button("📂 選択", key="btn_choose_bf", help="Finderで講義フォルダを選択", use_container_width=True):
+            chosen_bf = choose_folder_dialog("講義フォルダを選択してください")
+            if chosen_bf:
+                apply_folder_to_state(chosen_bf)
+                st.rerun()
+    with col_bf1:
+        base_folder = st.text_input(
+            "講義フォルダ",
+            key="base_folder_val",
+            on_change=on_base_folder_input_change,
+            placeholder="/path/to/lecture_folder",
+            label_visibility="collapsed"
+        )
+
+    # フォルダ内の設定ファイル有無をステータス表示
+    if base_folder and os.path.isdir(base_folder):
+        cfg_file_in_dir = os.path.join(base_folder, FOLDER_CONFIG_FILENAME)
+        if os.path.exists(cfg_file_in_dir):
+            st.caption(f"✅ フォルダ内設定 (`{FOLDER_CONFIG_FILENAME}`) 読込済")
+        else:
+            st.caption("🆕 新規フォルダ（設定未保存）")
+    elif base_folder:
+        st.warning("⚠️ フォルダが存在しません")
 
     deck_name = st.text_input("Deck名 (階層可)", key="deck_name_val")
     group_title = st.text_input("グループタイトル", key="group_title_val")
     pdf_pass = st.text_input("PDFパスワード (空白可)", key="pdf_pass_val", type="password")
     
-    st.markdown("講義フォルダ")
-    col_bf1, col_bf2 = st.columns([3, 1])
-    with col_bf2:
-        if st.button("📂", key="btn_choose_bf", help="フォルダ選択ダイアログを開く"):
-            chosen_bf = choose_folder_dialog("講義フォルダを選択してください")
-            if chosen_bf:
-                st.session_state.base_folder_val = chosen_bf
-                st.session_state.unmasked_pdf_val = os.path.join(chosen_bf, "講義.pdf")
-                st.session_state.masked_pdf_val = os.path.join(chosen_bf, "講義 masked.pdf")
-                st.rerun()
-    with col_bf1:
-        base_folder = st.text_input("講義フォルダ", key="base_folder_val", label_visibility="collapsed")
-    
-    if st.button("現在の設定をプリセット保存"):
-        presets[deck_name] = {
-            "deck_name": deck_name,
-            "group_title": group_title, 
-            "password": pdf_pass,
-            "base_folder": st.session_state.base_folder_val,
-            "unmasked_pdf": st.session_state.get("unmasked_pdf_val", ""),
-            "masked_pdf": st.session_state.get("masked_pdf_val", "")
-        }
-        save_presets(presets)
-        st.success(f"プリセット '{deck_name}' を保存しました")
-        st.rerun()
+    if st.button("💾 このフォルダに設定を保存", type="primary", use_container_width=True):
+        bf_target = st.session_state.base_folder_val.strip()
+        if not bf_target or not os.path.isdir(bf_target):
+            st.error("有効な講義フォルダを先に選択してください。")
+        else:
+            cfg_data = {
+                "deck_name": deck_name,
+                "group_title": group_title,
+                "password": pdf_pass,
+                "base_folder": bf_target,
+                "unmasked_pdf": st.session_state.get("unmasked_pdf_val", ""),
+                "masked_pdf": st.session_state.get("masked_pdf_val", ""),
+            }
+            save_folder_config(bf_target, cfg_data)
+            st.toast(f"✅ フォルダ内に {FOLDER_CONFIG_FILENAME} を保存しました")
+            st.rerun()
 
     st.markdown("---")
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
@@ -263,6 +357,17 @@ with tab_extract:
                 st.error("Masked PDF のバリデーションエラーを解消してください。")
             else:
                 with st.spinner("PDFレンダリング中..."):
+                    # 抽出実行時、講義フォルダが有効なら設定も自動保存しておく
+                    bf_cur = st.session_state.base_folder_val.strip()
+                    if bf_cur and os.path.isdir(bf_cur):
+                        save_folder_config(bf_cur, {
+                            "deck_name": deck_name,
+                            "group_title": group_title,
+                            "password": pdf_pass,
+                            "base_folder": bf_cur,
+                            "unmasked_pdf": unmasked_pdf,
+                            "masked_pdf": st.session_state.get("masked_pdf_val", ""),
+                        })
                     ts, cnt = extract_pdf_pages(unmasked_pdf, masked_pdf if mode == "事前Cloze済み (Masked PDFあり)" else None, pages_str, pdf_pass)
                     st.success(f"完了: {cnt} ページ分の画像（a/bペア）を exported_jpgs に書き出しました。")
                     st.rerun()
@@ -311,6 +416,8 @@ with tab_ai_batch:
                     html_text = call_gemini_enhance(img_path, api_key, model_id)
                     ai_cache[fn] = html_text
                     save_ai_cache(ai_cache)
+                    # 個別タブの編集用テキストエリアのステートも最新化
+                    st.session_state[f"edit_html_{fn}"] = html_text
                 except Exception as e:
                     st.error(f"{fn} でAPIエラー発生: {e}")
                     break
@@ -444,7 +551,6 @@ with tab_ai_inspect:
                         st.success(f"'{prompt_name}' を保存しました")
                         st.rerun()
             with sv_col3:
-                # ブラウザClipboard APIを利用したプロンプトコピーボタン
                 prompt_js = json.dumps(custom_prompt)
                 copy_btn_html = f"""
                 <button onclick='navigator.clipboard.writeText({prompt_js}); alert("プロンプトをクリップボードにコピーしました！");' 
@@ -488,46 +594,13 @@ with tab_ai_inspect:
                     new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
                     ai_cache[fn] = new_html
                     save_ai_cache(ai_cache)
+                    # 再生成されたHTMLソースが一番下のテキストエリアに即座に反映されるようStateを更新
+                    st.session_state[f"edit_html_{fn}"] = new_html
                     st.success("更新しました！")
                     st.rerun()
 
-        # --- HTML出力の編集・手動貼り付け用エリア（LLM App連携） ---
+        # --- 1. 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ) ---
         st.markdown("---")
-        st.markdown("#### 📝 AI解説HTMLの直接編集・貼り付け (ChatGPT/Claudeなどの結果を反映)")
-        current_html = ai_cache.get(fn, "")
-
-        with st.container(border=True):
-            edit_col1, edit_col2 = st.columns([4, 1])
-            with edit_col1:
-                edited_html = st.text_area(
-                    "解説HTMLコード (直接入力または貼り付け)",
-                    value=current_html,
-                    key=f"edit_html_{fn}",
-                    height=180,
-                    help="外部LLM（ChatGPT, Claude等）で作成したHTMLを貼り付けて保存できます。"
-                )
-            with edit_col2:
-                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                if st.button("💾 HTMLを手動保存", type="primary", use_container_width=True):
-                    clean_text = edited_html.strip()
-                    if clean_text.startswith("```html"): clean_text = clean_text[7:]
-                    if clean_text.startswith("```"): clean_text = clean_text[3:]
-                    if clean_text.endswith("```"): clean_text = clean_text[:-3]
-                    clean_text = clean_text.strip()
-                    
-                    ai_cache[fn] = clean_text
-                    save_ai_cache(ai_cache)
-                    st.success("HTML解説を保存しました！")
-                    st.rerun()
-                
-                if fn in ai_cache:
-                    if st.button("🗑️ この解説を消去", use_container_width=True):
-                        del ai_cache[fn]
-                        save_ai_cache(ai_cache)
-                        st.info("AI解説を消去しました。")
-                        st.rerun()
-
-        # --- 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ) ---
         st.markdown("#### プレビュー (Anki Back面)")
         if fn in ai_cache:
             preview_style = f"""
@@ -630,7 +703,47 @@ with tab_ai_inspect:
             """
             st.components.v1.html(preview_style, height=450, scrolling=True)
         else:
-            st.info("このスライドにはまだAI解説がありません。上のテキストエリアから手動入力するか、APIで生成してください。")
+            st.info("このスライドにはまだAI解説がありません。APIで生成するか、下のテキストエリアから手動入力してください。")
+
+        # --- 2. 一番下: HTMLソースコードの直接編集・手動貼り付け用エリア ---
+        st.markdown("---")
+        st.markdown("#### 📝 AI解説HTMLの直接編集・貼り付け (ChatGPT/Claudeなどの結果を反映)")
+        
+        edit_key = f"edit_html_{fn}"
+        if edit_key not in st.session_state:
+            st.session_state[edit_key] = ai_cache.get(fn, "")
+
+        with st.container(border=True):
+            edit_col1, edit_col2 = st.columns([4, 1])
+            with edit_col1:
+                edited_html = st.text_area(
+                    "解説HTMLソースコード (生成後に自動表示・直接編集または外部LLMの出力を貼り付け可能)",
+                    key=edit_key,
+                    height=220,
+                    help="API生成されたHTMLソースコードの微修正や、外部LLM（ChatGPT, Claude等）で作成したHTMLの貼り付け・保存が行えます。"
+                )
+            with edit_col2:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if st.button("💾 HTMLを手動保存", type="primary", use_container_width=True):
+                    clean_text = edited_html.strip()
+                    if clean_text.startswith("```html"): clean_text = clean_text[7:]
+                    if clean_text.startswith("```"): clean_text = clean_text[3:]
+                    if clean_text.endswith("```"): clean_text = clean_text[:-3]
+                    clean_text = clean_text.strip()
+                    
+                    ai_cache[fn] = clean_text
+                    st.session_state[edit_key] = clean_text
+                    save_ai_cache(ai_cache)
+                    st.toast("✅ HTML解説を保存し、プレビューを更新しました！")
+                    st.rerun()
+                
+                if fn in ai_cache:
+                    if st.button("🗑️ この解説を消去", use_container_width=True):
+                        del ai_cache[fn]
+                        st.session_state[edit_key] = ""
+                        save_ai_cache(ai_cache)
+                        st.info("AI解説を消去しました。")
+                        st.rerun()
 
 # タブ 4: Ankiパッケージ出力
 with tab_build:
