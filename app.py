@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import glob
 import json
 import subprocess
@@ -34,13 +35,23 @@ CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
 
+PRICING_MODELS = {
+    "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
+    "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
+    "Gemini 3.8 Flash (高推論Flash)":       {"id": "gemini-3.8-flash",      "in": 0.75, "out": 3.75},
+    "Gemini 4 Argon (〜11/30 特割)":        {"id": "gemini-4-argon",        "in": 2.00, "out": 10.00},
+    "Gemini 4 Argon (12/1〜 通常)":         {"id": "gemini-4-argon",        "in": 4.00, "out": 20.00},
+    "Gemini 2.5 Flash (レガシー)":          {"id": "gemini-2.5-flash",      "in": 0.30, "out": 2.50},
+}
+USD_JPY = 155.0
+
+
 # --- ~/.last_work_dir による最後の作業フォルダ記憶ヘルパー ---
 def get_last_folder():
     if os.path.exists(LAST_WORK_DIR_FILE):
         try:
             with open(LAST_WORK_DIR_FILE, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-            # プレーンテキスト形式（もしJSON形式だった場合も両対応）
             if content.startswith("{"):
                 bf = json.loads(content).get("last_base_folder", "")
             else:
@@ -49,7 +60,6 @@ def get_last_folder():
                 return bf
         except Exception:
             pass
-    # フォールバック: 旧プリセットファイルがあれば先頭のフォルダを引き継ぐ
     if os.path.exists(LEGACY_PRESETS_FILE):
         try:
             presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
@@ -71,33 +81,55 @@ def save_last_folder(folder_path):
         pass
 
 
-PRICING_MODELS = {
-    "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
-    "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
-    "Gemini 3.8 Flash (高推論Flash)":       {"id": "gemini-3.8-flash",      "in": 0.75, "out": 3.75},
-    "Gemini 4 Argon (〜11/30 特割)":        {"id": "gemini-4-argon",        "in": 2.00, "out": 10.00},
-    "Gemini 4 Argon (12/1〜 通常)":         {"id": "gemini-4-argon",        "in": 4.00, "out": 20.00},
-    "Gemini 2.5 Flash (レガシー)":          {"id": "gemini-2.5-flash",      "in": 0.30, "out": 2.50},
-}
-USD_JPY = 155.0
+# --- Masked PDF パスから Unmasked PDF パスを自動推論するヘルパー ---
+def infer_unmasked_from_masked(masked_path):
+    """
+    与えられた masked_path のファイル名（拡張子除く）から [_\s]+masked$ を除去し、
+    同一フォルダ内の対応する unmasked PDF パスを検出して返す。
+    """
+    if not masked_path or not masked_path.strip():
+        return ""
+    masked_path = masked_path.strip()
+    folder = os.path.dirname(masked_path)
+    filename = os.path.basename(masked_path)
+    stem, ext = os.path.splitext(filename)
 
-def save_last_folder(folder_path):
-    try:
-        json.dump({"last_base_folder": folder_path}, open(LAST_STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    # 末尾の "_masked" や " masked" を除去 (大文字小文字不問)
+    clean_stem = re.sub(r'[_\s]+masked$', '', stem, flags=re.IGNORECASE)
+    if clean_stem == stem:
+        # アンダースコアや空白なしで末尾が masked の場合のフォールバック
+        clean_stem = re.sub(r'masked$', '', stem, flags=re.IGNORECASE).rstrip('_- ')
+
+    candidate = os.path.join(folder, f"{clean_stem}{ext}")
+    if os.path.exists(candidate):
+        return candidate
+
+    # フォルダ内で大文字小文字の違いを含めて一致するPDFを探す
+    if folder and os.path.isdir(folder):
+        for f in os.listdir(folder):
+            if f.lower() == f"{clean_stem}{ext}".lower():
+                return os.path.join(folder, f)
+
+    # まだファイルが存在しない場合でも推論した標準パスを返す
+    return candidate
+
 
 def auto_detect_pdfs(folder_path):
     """フォルダ内のPDFから unmasked / masked を自動推測する"""
     if not folder_path or not os.path.isdir(folder_path):
         return "", ""
     pdfs = sorted(glob.glob(os.path.join(folder_path, "*.pdf")))
-    masked = [p for p in pdfs if "masked" in os.path.basename(p).lower()]
-    unmasked = [p for p in pdfs if "masked" not in os.path.basename(p).lower()]
+    masked = [p for p in pdfs if re.search(r'[_\s]*masked\.pdf$', os.path.basename(p), re.IGNORECASE)]
+    unmasked = [p for p in pdfs if p not in masked]
     
-    u_path = unmasked[0] if unmasked else os.path.join(folder_path, "講義.pdf")
     m_path = masked[0] if masked else os.path.join(folder_path, "講義 masked.pdf")
+    if masked:
+        inferred_u = infer_unmasked_from_masked(m_path)
+        u_path = inferred_u if (inferred_u and os.path.exists(inferred_u)) else (unmasked[0] if unmasked else inferred_u)
+    else:
+        u_path = unmasked[0] if unmasked else os.path.join(folder_path, "講義.pdf")
     return u_path, m_path
+
 
 def load_folder_config(folder_path):
     """指定フォルダ内の lecture_config.json を読み込む。無ければ旧プリセットや自動検出で補完"""
@@ -110,7 +142,6 @@ def load_folder_config(folder_path):
         except Exception:
             pass
 
-    # 旧 lecture_presets.json に同じ base_folder の設定があればマイグレーション利用
     if os.path.exists(LEGACY_PRESETS_FILE):
         try:
             presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
@@ -120,7 +151,6 @@ def load_folder_config(folder_path):
         except Exception:
             pass
 
-    # 新規フォルダの場合はフォルダ名と内部PDFから初期値を推測
     folder_name = os.path.basename(folder_path.rstrip("/"))
     u_pdf, m_pdf = auto_detect_pdfs(folder_path)
     return {
@@ -149,8 +179,8 @@ def apply_folder_to_state(folder_path):
     st.session_state.deck_name_val = cfg.get("deck_name", "")
     st.session_state.group_title_val = cfg.get("group_title", "")
     st.session_state.pdf_pass_val = cfg.get("password", "")
-    st.session_state.unmasked_pdf_val = cfg.get("unmasked_pdf") or u_default
     st.session_state.masked_pdf_val = cfg.get("masked_pdf") or m_default
+    st.session_state.unmasked_pdf_val = cfg.get("unmasked_pdf") or u_default
     save_last_folder(folder_path)
 
 
@@ -194,14 +224,22 @@ def keep_recent_prompt(p_text):
     store["recent"] = recent[:5]
     save_prompt_store(store)
 
-# --- ファイル / フォルダ選択ダイアログ (macOS Finder) ---
-def choose_folder_dialog(title="フォルダを選択"):
-    script = f'POSIX path of (choose folder with prompt "{title}")'
+# --- ファイル / フォルダ選択ダイアログ (macOS Finder: ~/.last_work_dir 起点) ---
+def choose_folder_dialog(title="フォルダを選択", default_dir=None):
+    target = default_dir or get_last_folder()
+    if target and os.path.isdir(target):
+        script = f'POSIX path of (choose folder with prompt "{title}" default location (POSIX file "{target}"))'
+    else:
+        script = f'POSIX path of (choose folder with prompt "{title}")'
     res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     return res.stdout.strip().rstrip("/") if res.returncode == 0 else None
 
-def choose_file_dialog(title="ファイルを選択"):
-    script = f'POSIX path of (choose file with prompt "{title}")'
+def choose_file_dialog(title="ファイルを選択", default_dir=None):
+    target = default_dir or get_last_folder()
+    if target and os.path.isdir(target):
+        script = f'POSIX path of (choose file with prompt "{title}" default location (POSIX file "{target}"))'
+    else:
+        script = f'POSIX path of (choose file with prompt "{title}")'
     res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     return res.stdout.strip() if res.returncode == 0 else None
 
@@ -237,6 +275,17 @@ def on_base_folder_input_change():
     if bf and os.path.isdir(bf):
         apply_folder_to_state(bf)
 
+# Masked PDF テキストボックスが直接編集されたときに Unmasked を自動推論するコールバック
+def on_masked_input_change():
+    m_val = st.session_state.masked_input_widget.strip()
+    st.session_state.masked_pdf_val = m_val
+    inferred = infer_unmasked_from_masked(m_val)
+    if inferred:
+        st.session_state.unmasked_pdf_val = inferred
+
+def on_unmasked_input_change():
+    st.session_state.unmasked_pdf_val = st.session_state.unmasked_input_widget.strip()
+
 # --- サイドバー: フォルダ起点の設定管理 (Exam2Anki方式) ---
 with st.sidebar:
     st.header("講義フォルダ・デッキ設定")
@@ -245,7 +294,9 @@ with st.sidebar:
     col_bf1, col_bf2 = st.columns([3.2, 1])
     with col_bf2:
         if st.button("📂 選択", key="btn_choose_bf", help="Finderで講義フォルダを選択", use_container_width=True):
-            chosen_bf = choose_folder_dialog("講義フォルダを選択してください")
+            cur_dir = st.session_state.get("base_folder_val", "")
+            start_dir = os.path.dirname(cur_dir) if (cur_dir and os.path.isdir(cur_dir)) else cur_dir
+            chosen_bf = choose_folder_dialog("講義フォルダを選択してください", default_dir=start_dir)
             if chosen_bf:
                 apply_folder_to_state(chosen_bf)
                 st.rerun()
@@ -321,34 +372,42 @@ with tab_extract:
 
     mode = st.radio("Cloze準備の形式", ["事前Cloze済み (Masked PDFあり)", "事後Cloze作成 (Unmaskedのみから生成)"])
     
-    st.markdown("講義資料PDF (Unmasked) パス")
-    col_u1, col_u2 = st.columns([5, 1])
-    with col_u2:
-        if st.button("📄 選択...", key="btn_choose_unmasked"):
-            chosen_u = choose_file_dialog("講義資料PDF (Unmasked) を選択")
-            if chosen_u:
-                st.session_state.unmasked_pdf_val = chosen_u
-                st.rerun()
-    with col_u1:
-        unmasked_pdf = st.text_input("講義資料PDF (Unmasked) パス", value=st.session_state.unmasked_pdf_val, label_visibility="collapsed")
-        st.session_state.unmasked_pdf_val = unmasked_pdf
-
     masked_pdf = None
+    unmasked_pdf = None
     is_masked_valid = True
+
     if mode == "事前Cloze済み (Masked PDFあり)":
-        st.markdown("マスク済みPDF (Masked) パス <span style='color:#ef4444; font-size:12px;'>※ファイル名に 'masked' が必須</span>", unsafe_allow_html=True)
+        # 1. 上段: Masked PDF パス（主選択）
+        st.markdown(
+            "1️⃣ **マスク済みPDF (Masked) パス** <span style='color:#ef4444; font-size:12px;'>※これを選択すると下のUnmasked PDFを自動検出します</span>",
+            unsafe_allow_html=True
+        )
         col_m1, col_m2 = st.columns([5, 1])
         with col_m2:
-            if st.button("📄 選択...", key="btn_choose_masked"):
-                chosen_m = choose_file_dialog("マスク済みPDF (Masked) を選択")
+            if st.button("📄 選択...", key="btn_choose_masked", use_container_width=True):
+                chosen_m = choose_file_dialog("マスク済みPDF (Masked) を選択", default_dir=st.session_state.get("base_folder_val"))
                 if chosen_m:
                     st.session_state.masked_pdf_val = chosen_m
+                    # [_\s]+masked$ を除去して Unmasked PDF を自動セット
+                    inferred_u = infer_unmasked_from_masked(chosen_m)
+                    if inferred_u:
+                        st.session_state.unmasked_pdf_val = inferred_u
+                    # 講義フォルダが未設定なら親フォルダをセット
+                    parent_dir = os.path.dirname(chosen_m)
+                    if parent_dir and not st.session_state.get("base_folder_val"):
+                        st.session_state.base_folder_val = parent_dir
                     st.rerun()
         with col_m1:
-            masked_pdf = st.text_input("マスク済みPDF (Masked) パス", value=st.session_state.masked_pdf_val, label_visibility="collapsed")
+            st.session_state.masked_input_widget = st.session_state.masked_pdf_val
+            masked_pdf = st.text_input(
+                "マスク済みPDF (Masked) パス",
+                key="masked_input_widget",
+                on_change=on_masked_input_change,
+                label_visibility="collapsed"
+            )
             st.session_state.masked_pdf_val = masked_pdf
 
-        # --- Masked PDF バリデーション ---
+        # Masked PDF バリデーション
         masked_fn = os.path.basename(masked_pdf.strip()) if masked_pdf else ""
         if not masked_pdf or not masked_pdf.strip():
             st.warning("⚠️ 事前Clozeモードでは Masked PDF の指定が必須です。")
@@ -356,9 +415,60 @@ with tab_extract:
         elif not os.path.exists(masked_pdf):
             st.error(f"⚠️ 指定された Masked PDF が見つかりません: `{masked_pdf}`")
             is_masked_valid = False
-        elif "masked" not in masked_fn.lower():
-            st.error(f"⚠️ **無効なファイル名**: 事前Cloze用のPDF名には必ず `masked` を含める必要があります (指定名: `{masked_fn}`)")
+        elif not re.search(r'[_\s]*masked\.pdf$', masked_fn, re.IGNORECASE):
+            st.error(f"⚠️ **無効なファイル名**: 事前Cloze用のPDF名には末尾に `masked` を含める必要があります (指定名: `{masked_fn}`)")
             is_masked_valid = False
+
+        # もし unmasked_pdf_val が空、または存在しない場合は現在の masked_pdf から自動補完を試みる
+        if is_masked_valid and (not st.session_state.unmasked_pdf_val or not os.path.exists(st.session_state.unmasked_pdf_val)):
+            auto_u = infer_unmasked_from_masked(masked_pdf)
+            if auto_u and os.path.exists(auto_u):
+                st.session_state.unmasked_pdf_val = auto_u
+
+        # 2. 下段: Unmasked PDF パス（自動検出 ＋ Manual Override 可能）
+        u_exists = bool(st.session_state.unmasked_pdf_val and os.path.exists(st.session_state.unmasked_pdf_val))
+        badge_html = (
+            "<span style='color:#16a34a; font-size:12px;'>✅ 自動検出済 (手動変更も可)</span>"
+            if u_exists else
+            "<span style='color:#d97706; font-size:12px;'>⚠️ 自動検出できませんでした。手動で選択してください</span>"
+        )
+        st.markdown(f"2️⃣ **講義資料PDF (Unmasked) パス** {badge_html}", unsafe_allow_html=True)
+        col_u1, col_u2 = st.columns([5, 1])
+        with col_u2:
+            if st.button("📄 選択...", key="btn_choose_unmasked", use_container_width=True):
+                chosen_u = choose_file_dialog("講義資料PDF (Unmasked) を選択", default_dir=st.session_state.get("base_folder_val"))
+                if chosen_u:
+                    st.session_state.unmasked_pdf_val = chosen_u
+                    st.rerun()
+        with col_u1:
+            st.session_state.unmasked_input_widget = st.session_state.unmasked_pdf_val
+            unmasked_pdf = st.text_input(
+                "講義資料PDF (Unmasked) パス",
+                key="unmasked_input_widget",
+                on_change=on_unmasked_input_change,
+                label_visibility="collapsed"
+            )
+            st.session_state.unmasked_pdf_val = unmasked_pdf
+
+    else:
+        # 事後Cloze作成モード（Unmaskedのみ）
+        st.markdown("**講義資料PDF (Unmasked) パス**")
+        col_u1, col_u2 = st.columns([5, 1])
+        with col_u2:
+            if st.button("📄 選択...", key="btn_choose_unmasked_only", use_container_width=True):
+                chosen_u = choose_file_dialog("講義資料PDF (Unmasked) を選択", default_dir=st.session_state.get("base_folder_val"))
+                if chosen_u:
+                    st.session_state.unmasked_pdf_val = chosen_u
+                    st.rerun()
+        with col_u1:
+            st.session_state.unmasked_input_widget = st.session_state.unmasked_pdf_val
+            unmasked_pdf = st.text_input(
+                "講義資料PDF (Unmasked) パス",
+                key="unmasked_input_widget",
+                on_change=on_unmasked_input_change,
+                label_visibility="collapsed"
+            )
+            st.session_state.unmasked_pdf_val = unmasked_pdf
 
     pages_str = st.text_input("対象ページ (例: 1-10, 14, 25 または all)", value="all")
 
@@ -367,12 +477,11 @@ with tab_extract:
         btn_extract = st.button("🖼️ JPEG画像を抽出・生成", type="primary")
         if btn_extract:
             if not unmasked_pdf or not os.path.exists(unmasked_pdf):
-                st.error("Unmasked PDFが見つかりません。")
+                st.error(f"Unmasked PDFが見つかりません: `{unmasked_pdf}`")
             elif mode == "事前Cloze済み (Masked PDFあり)" and not is_masked_valid:
                 st.error("Masked PDF のバリデーションエラーを解消してください。")
             else:
                 with st.spinner("PDFレンダリング中..."):
-                    # 抽出実行時、講義フォルダが有効なら設定も自動保存しておく
                     bf_cur = st.session_state.base_folder_val.strip()
                     if bf_cur and os.path.isdir(bf_cur):
                         save_folder_config(bf_cur, {
@@ -431,8 +540,7 @@ with tab_ai_batch:
                     html_text = call_gemini_enhance(img_path, api_key, model_id)
                     ai_cache[fn] = html_text
                     save_ai_cache(ai_cache)
-                    # 個別タブの編集用テキストエリアのステートも最新化
-                    st.session_state[f"edit_html_{fn}"] = html_text
+                    st.session_state.pop(f"edit_html_{fn}", None)
                 except Exception as e:
                     st.error(f"{fn} でAPIエラー発生: {e}")
                     break
@@ -501,7 +609,6 @@ with tab_ai_inspect:
         with col_v1:
             st.image(target_img, caption=fn, use_container_width=True)
             
-            # --- 画像クリップボードコピー用ボタン (外部LLM利用向け) ---
             if st.button("📋 画像をクリップボードにコピー (for ChatGPT / Claude)", use_container_width=True):
                 if copy_image_to_clipboard_macos(target_img):
                     st.toast("✅ 画像をクリップボードにコピーしました！外部チャットにそのまま貼り付け可能です。")
@@ -554,7 +661,6 @@ with tab_ai_inspect:
                 height=110,
             )
 
-            # --- プロンプトのクリップボードコピー & プリセット保存行 ---
             sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1])
             with sv_col1:
                 prompt_name = st.text_input("プロンプト保存名", placeholder="名前をつけて保存...", label_visibility="collapsed")
@@ -575,7 +681,6 @@ with tab_ai_inspect:
                 """
                 st.components.v1.html(copy_btn_html, height=45)
 
-            # --- モデル選択 & API再生成 ---
             model_labels = list(PRICING_MODELS.keys())
             default_idx = 0
             for idx, label in enumerate(model_labels):
@@ -609,8 +714,7 @@ with tab_ai_inspect:
                     new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
                     ai_cache[fn] = new_html
                     save_ai_cache(ai_cache)
-                    # 再生成されたHTMLソースが一番下のテキストエリアに即座に反映されるようStateを更新
-                    st.session_state[f"edit_html_{fn}"] = new_html
+                    st.session_state.pop(f"edit_html_{fn}", None)
                     st.success("更新しました！")
                     st.rerun()
 
@@ -747,16 +851,16 @@ with tab_ai_inspect:
                     clean_text = clean_text.strip()
                     
                     ai_cache[fn] = clean_text
-                    st.session_state[edit_key] = clean_text
                     save_ai_cache(ai_cache)
+                    st.session_state.pop(edit_key, None)
                     st.toast("✅ HTML解説を保存し、プレビューを更新しました！")
                     st.rerun()
                 
                 if fn in ai_cache:
                     if st.button("🗑️ この解説を消去", use_container_width=True):
                         del ai_cache[fn]
-                        st.session_state[edit_key] = ""
                         save_ai_cache(ai_cache)
+                        st.session_state.pop(edit_key, None)
                         st.info("AI解説を消去しました。")
                         st.rerun()
 
@@ -765,7 +869,6 @@ with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
     st.write(f"出力先デッキ名: **{deck_name}**")
     
-    # 講義フォルダが設定されている場合はデフォルトの保存先にする
     bf = st.session_state.get("base_folder_val", "").strip()
     target_dir = bf if (bf and os.path.exists(bf)) else "."
     display_dir = os.path.abspath(target_dir)
