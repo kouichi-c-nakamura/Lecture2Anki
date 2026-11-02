@@ -192,12 +192,22 @@ def save_ai_cache(data):
     json.dump(data, open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 # --- 画像をmacOSクリップボードへコピーするヘルパー ---
+# --- 画像をmacOSクリップボードへコピーするヘルパー ---
 def copy_image_to_clipboard_macos(image_path):
     abs_path = os.path.abspath(image_path)
+    if not os.path.exists(abs_path):
+        return False
+    # AppKit (NSImage / NSPasteboard) を使用して正規の画像オブジェクトとしてクリップボードへ格納
     osa = f'''
-    set theFile to POSIX file "{abs_path}"
-    set theImage to read theFile as «class PNG »
-    set the clipboard to theImage
+    use framework "AppKit"
+    set theImage to current application's NSImage's alloc()'s initWithContentsOfFile:"{abs_path}"
+    if theImage is not missing value then
+        set pb to current application's NSPasteboard's generalPasteboard()
+        pb's clearContents()
+        pb's writeObjects:{{theImage}}
+    else
+        error "Failed to load image"
+    end if
     '''
     res = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
     return res.returncode == 0
