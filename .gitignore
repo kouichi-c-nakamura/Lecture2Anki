@@ -24,3 +24,4 @@ ai_notes_cache.json
 .claude/*
 .vscode/*
 custom_prompts.json
+.last_lecture_folder.json

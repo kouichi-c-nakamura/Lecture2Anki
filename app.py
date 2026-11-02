@@ -26,12 +26,50 @@ if not shutil.which("pdftoppm") and get_poppler_path() is None:
     """)
 
 load_dotenv()
-LAST_STATE_FILE = ".last_lecture_folder.json"
+
+LAST_WORK_DIR_FILE = os.path.expanduser("~/.last_work_dir")
 LEGACY_PRESETS_FILE = "lecture_presets.json"
 FOLDER_CONFIG_FILENAME = "lecture_config.json"
 CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
+
+# --- ~/.last_work_dir による最後の作業フォルダ記憶ヘルパー ---
+def get_last_folder():
+    if os.path.exists(LAST_WORK_DIR_FILE):
+        try:
+            with open(LAST_WORK_DIR_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            # プレーンテキスト形式（もしJSON形式だった場合も両対応）
+            if content.startswith("{"):
+                bf = json.loads(content).get("last_base_folder", "")
+            else:
+                bf = content
+            if bf and os.path.isdir(bf):
+                return bf
+        except Exception:
+            pass
+    # フォールバック: 旧プリセットファイルがあれば先頭のフォルダを引き継ぐ
+    if os.path.exists(LEGACY_PRESETS_FILE):
+        try:
+            presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
+            for v in presets.values():
+                bf = v.get("base_folder", "")
+                if bf and os.path.isdir(bf):
+                    return bf
+        except Exception:
+            pass
+    return ""
+
+def save_last_folder(folder_path):
+    if not folder_path:
+        return
+    try:
+        with open(LAST_WORK_DIR_FILE, "w", encoding="utf-8") as f:
+            f.write(folder_path.strip())
+    except Exception:
+        pass
+
 
 PRICING_MODELS = {
     "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
@@ -42,29 +80,6 @@ PRICING_MODELS = {
     "Gemini 2.5 Flash (レガシー)":          {"id": "gemini-2.5-flash",      "in": 0.30, "out": 2.50},
 }
 USD_JPY = 155.0
-
-
-# --- 講義フォルダ単位の設定ロード・保存ヘルパー (Exam2Anki方式) ---
-def get_last_folder():
-    if os.path.exists(LAST_STATE_FILE):
-        try:
-            data = json.load(open(LAST_STATE_FILE, "r", encoding="utf-8"))
-            bf = data.get("last_base_folder", "")
-            if bf and os.path.exists(bf):
-                return bf
-        except Exception:
-            pass
-    # 旧プリセットファイルがあれば先頭のフォルダを引き継ぐ
-    if os.path.exists(LEGACY_PRESETS_FILE):
-        try:
-            presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
-            for v in presets.values():
-                bf = v.get("base_folder", "")
-                if bf and os.path.exists(bf):
-                    return bf
-        except Exception:
-            pass
-    return ""
 
 def save_last_folder(folder_path):
     try:
