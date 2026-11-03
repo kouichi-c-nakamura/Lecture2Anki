@@ -50,8 +50,47 @@ OUTPUT_REQUIREMENTS = r"""【構成・出力要件】
    - インライン数式: \( ... \)
    - ディスプレイ数式（別行立て）: \[ ... \]"""
 
-# UIで表示・編集・送信するユーザープロンプト（初期値）
+# UIで表示・編集・送信する標準ユーザープロンプト（初期値）
 DEFAULT_PROMPT = f"""この講義スライド画像を分析し、医学生の復習・国試・定期試験対策として直感的に理解できる「最高品質の補足解説」をHTML形式で作成してください。
+
+{OUTPUT_REQUIREMENTS}"""
+
+# SVGオーバーレイ図示付きの個別生成用プロンプト
+SVG_OVERLAY_REQUIREMENTS = r"""【SVGオーバーレイ図示の要件（最上部に配置）】
+0. スライド画像のSVGオーバーレイ図示:
+   画像内の重要な解剖学的指標、病変部位、画像所見、病理組織学的特徴を視覚的にポインティングするため、解説の冒頭（<div class="ai-title">の前）に以下の構造でSVGオーバーレイラッパーを出力すること。
+   - 画像のアスペクト比（16:9なら viewBox="0 0 1000 562"、4:3なら viewBox="0 0 1000 750"）に合わせて座標を計算し、対象部位を <ellipse>, <circle>, <rect>, <line> 等で正確に囲み、引き出し線と <text> で [1], [2], [3]... と番号付きの簡潔なラベルを付けること。
+   - 視認性を高めるため、部位ごとに鮮やかな色（#ffea00, #00e5ff, #ff6e40, #ff4081 等）を使い分け、文字には黒縁取り（paint-order: stroke; stroke: #000000; stroke-width: 4.5px;）を適用すること。
+   - 右上角には Toggle とだけ記した表示切替ボタンを配置し、スライドを隠さないよう「ラッパーにマウスホバーした時だけボタンが浮かび上がる（通常時 opacity: 0; ➔ ホバー時 opacity: 0.85;）」仕様とすること。
+   - 画像の src 属性には SLIDE_IMAGE.jpg を指定すること（システム側で実ファイル名に自動置換される）。
+   - 以降の【病理的/臨床的的核心】やカスケードの解説本文中では、SVG内で図示した [1], [2]... の番号を引用し、画像上の位置と解説が直感的に対応するように記述すること。
+
+   ▼ 冒頭に出力するSVGラッパーのテンプレート構造:
+   <div class="svg-overlay-wrap" style="position: relative; display: inline-block; width: 100%; max-width: 850px; line-height: 0; margin-bottom: 16px;">
+     <style>
+       .svg-overlay-wrap .svg-toggle-btn { opacity: 0; transition: opacity 0.2s ease-in-out; }
+       .svg-overlay-wrap:hover .svg-toggle-btn { opacity: 0.85; }
+       .svg-overlay-wrap .svg-toggle-btn:hover { opacity: 1 !important; }
+     </style>
+     <img src="SLIDE_IMAGE.jpg" style="width: 100%; height: auto; display: block;">
+     <button class="svg-toggle-btn" onclick="const s=this.nextElementSibling; s.style.display=s.style.display==='none'?'block':'none';" style="position: absolute; top: 8px; right: 8px; z-index: 10; padding: 4px 10px; font-size: 12px; font-family: monospace; background: rgba(0,0,0,0.75); color: #fff; border: 1px solid #888; border-radius: 4px; cursor: pointer;">
+       Toggle
+     </button>
+     <svg viewBox="0 0 1000 562" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;">
+       <defs>
+         <style>
+           .lbl { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 15px; font-weight: bold; paint-order: stroke; stroke: #000000; stroke-width: 4.5px; stroke-linecap: round; stroke-linejoin: round; }
+           .sub { font-size: 13px; }
+         </style>
+       </defs>
+       <!-- ここに [1], [2], [3]... の図形・引き出し線・ラベルを記述 -->
+     </svg>
+   </div>"""
+
+SVG_OVERLAY_PROMPT = f"""この講義スライド画像を分析し、医学生の復習・国試・定期試験対策として直感的に理解できる「SVGオーバーレイ図示付きの最高品質の補足解説」をHTML形式で作成してください。
+マークダウンのコードブロック（```html 等）は出力せず、HTMLタグのみを直接出力してください。
+
+{SVG_OVERLAY_REQUIREMENTS}
 
 {OUTPUT_REQUIREMENTS}"""
 
@@ -61,7 +100,7 @@ SYSTEM_PROMPT = f"""あなたは医学部専門の基礎医学・臨床医学の
 
 【厳格な出力制約】
 1. マークダウンのコードブロック（```html ... ``` や ``` ... ```）は一切出力せず、直接埋め込み可能なHTMLタグ（div等）のみを出力すること。
-2. 数式を出力する際、$ や $$ は厳禁。必ず \( ... \) または \[ ... \] を用いること。
+2. 数式を出力する際、$ や $$ は厳禁。必ず \(...\) または [ ... ] を用いること。
 
 {OUTPUT_REQUIREMENTS}"""
 
@@ -180,8 +219,18 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
             front_html = f'<div style="text-align:center;font-size:13px;color:#888;">{p_label}</div><img src="{f_img}">'
             
             ai_body = ai_cache.get(b_img, "") if ai_cache else ""
-            ai_html = f'<div class="ai-container">{ai_body}</div>' if ai_body else ""
-            back_html = f'<img src="{b_img}">{ai_html}'
+            if "<svg" in ai_body and "<img" in ai_body:
+                # SVGオーバーレイ付きの解説なら、内部の <img> の src を実際の b_img ファイル名に自動置換し、外側の <img> 重複出力を防ぐ
+                ai_body_fixed = re.sub(
+                    r'(<img\s+[^>]*src=["\'])([^"\']+)(["\'])',
+                    rf'\g<1>{b_img}\g<3>',
+                    ai_body,
+                    count=1
+                )
+                back_html = f'<div class="ai-container">{ai_body_fixed}</div>'
+            else:
+                ai_html = f'<div class="ai-container">{ai_body}</div>' if ai_body else ""
+                back_html = f'<img src="{b_img}">{ai_html}'
 
             guid = genanki.guid_for(f"{deck_name}_{data['page']}")
             note = genanki.Note(model=model, fields=[front_html, back_html], guid=guid)

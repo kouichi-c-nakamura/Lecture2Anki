@@ -15,6 +15,7 @@ from pipeline_util import (
     build_apkg,
     get_poppler_path,
     DEFAULT_PROMPT,
+    SVG_OVERLAY_PROMPT,
 )
 
 # Popplerが実行可能かチェック
@@ -192,12 +193,10 @@ def save_ai_cache(data):
     json.dump(data, open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 # --- 画像をmacOSクリップボードへコピーするヘルパー ---
-# --- 画像をmacOSクリップボードへコピーするヘルパー ---
 def copy_image_to_clipboard_macos(image_path):
     abs_path = os.path.abspath(image_path)
     if not os.path.exists(abs_path):
         return False
-    # AppKit (NSImage / NSPasteboard) を使用して正規の画像オブジェクトとしてクリップボードへ格納
     osa = f'''
     use framework "AppKit"
     set theImage to current application's NSImage's alloc()'s initWithContentsOfFile:"{abs_path}"
@@ -226,7 +225,7 @@ def save_prompt_store(store):
 
 def keep_recent_prompt(p_text):
     p_clean = p_text.strip()
-    if not p_clean or p_clean == DEFAULT_PROMPT:
+    if not p_clean or p_clean in (DEFAULT_PROMPT, SVG_OVERLAY_PROMPT):
         return
     store = get_prompt_store()
     recent = [p for p in store.get("recent", []) if p != p_clean]
@@ -398,11 +397,9 @@ with tab_extract:
                 chosen_m = choose_file_dialog("マスク済みPDF (Masked) を選択", default_dir=st.session_state.get("base_folder_val"))
                 if chosen_m:
                     st.session_state.masked_pdf_val = chosen_m
-                    # [_\s]+masked$ を除去して Unmasked PDF を自動セット
                     inferred_u = infer_unmasked_from_masked(chosen_m)
                     if inferred_u:
                         st.session_state.unmasked_pdf_val = inferred_u
-                    # 講義フォルダが未設定なら親フォルダをセット
                     parent_dir = os.path.dirname(chosen_m)
                     if parent_dir and not st.session_state.get("base_folder_val"):
                         st.session_state.base_folder_val = parent_dir
@@ -429,7 +426,6 @@ with tab_extract:
             st.error(f"⚠️ **無効なファイル名**: 事前Cloze用のPDF名には末尾に `masked` を含める必要があります (指定名: `{masked_fn}`)")
             is_masked_valid = False
 
-        # もし unmasked_pdf_val が空、または存在しない場合は現在の masked_pdf から自動補完を試みる
         if is_masked_valid and (not st.session_state.unmasked_pdf_val or not os.path.exists(st.session_state.unmasked_pdf_val)):
             auto_u = infer_unmasked_from_masked(masked_pdf)
             if auto_u and os.path.exists(auto_u):
@@ -649,7 +645,10 @@ with tab_ai_inspect:
             def on_reset_default():
                 st.session_state.custom_prompt_val = DEFAULT_PROMPT
 
-            pm_col1, pm_col2 = st.columns([2.5, 1])
+            def on_set_svg_prompt():
+                st.session_state.custom_prompt_val = SVG_OVERLAY_PROMPT
+
+            pm_col1, pm_col2, pm_col3 = st.columns([2.2, 1, 1.1])
             with pm_col1:
                 st.selectbox(
                     "プロンプト呼び出しメニュー",
@@ -660,13 +659,21 @@ with tab_ai_inspect:
                 )
             with pm_col2:
                 st.button(
-                    "🔄 Defaultに戻す",
+                    "🔄 Default",
                     on_click=on_reset_default,
+                    help="通常の解説プロンプトに戻します",
+                    use_container_width=True,
+                )
+            with pm_col3:
+                st.button(
+                    "🎯 SVG図示",
+                    on_click=on_set_svg_prompt,
+                    help="ホバーToggleボタン付きのSVGオーバーレイ図示プロンプトに切り替えます",
                     use_container_width=True,
                 )
 
             custom_prompt = st.text_area(
-                "プロンプト（初期値: 一括追加と同じDefaultプロンプト）",
+                "プロンプト（Default または 🎯SVG図示 を選択・編集可能）",
                 key="custom_prompt_val",
                 height=110,
             )
@@ -728,10 +735,24 @@ with tab_ai_inspect:
                     st.success("更新しました！")
                     st.rerun()
 
-        # --- 1. 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ) ---
+        # --- 1. 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ + SVGオーバーレイ実画像対応) ---
         st.markdown("---")
         st.markdown("#### プレビュー (Anki Back面)")
         if fn in ai_cache:
+            preview_html_body = ai_cache[fn]
+            has_svg_overlay = ("<svg" in preview_html_body and "<img" in preview_html_body)
+            
+            # SVGオーバーレイが含まれている場合、プレビューでも実画像が表示されるよう src を Base64 に動的置換
+            if has_svg_overlay and os.path.exists(target_img):
+                with open(target_img, "rb") as img_f:
+                    full_b64 = base64.b64encode(img_f.read()).decode("utf-8")
+                preview_html_body = re.sub(
+                    r'(<img\s+[^>]*src=["\'])([^"\']+)(["\'])',
+                    rf'\g<1>data:image/jpeg;base64,{full_b64}\g<3>',
+                    preview_html_body,
+                    count=1
+                )
+
             preview_style = f"""
             <style>
                 html, body {{
@@ -826,11 +847,11 @@ with tab_ai_inspect:
             </style>
             <div class="card-preview">
                 <div class="ai-container">
-                    {ai_cache[fn]}
+                    {preview_html_body}
                 </div>
             </div>
             """
-            st.components.v1.html(preview_style, height=450, scrolling=True)
+            st.components.v1.html(preview_style, height=620 if has_svg_overlay else 450, scrolling=True)
         else:
             st.info("このスライドにはまだAI解説がありません。APIで生成するか、下のテキストエリアから手動入力してください。")
 
