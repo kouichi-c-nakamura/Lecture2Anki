@@ -3,9 +3,20 @@ import time
 import json
 import urllib.request
 import subprocess
-from playwright.sync_api import sync_playwright
 
 CDP_URL = "http://localhost:9222"
+
+
+# ==============================================================================
+# Playwright インストール有無チェック
+# ==============================================================================
+def is_playwright_installed():
+    """Playwright パッケージがインポート可能か確認する"""
+    try:
+        import playwright
+        return True
+    except ImportError:
+        return False
 
 
 # ==============================================================================
@@ -185,6 +196,11 @@ def execute_cdp_batch(
     選択された複数のスライド画像を順番に Chrome CDP 経由で Gemini App に送信し、
     完了するごとに on_progress(idx, total, filename, html_result, error) をコールバックする。
     """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Playwright がインストールされていません。ターミナルで `pip install playwright` を実行してください。")
+    
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(cdp_url)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
