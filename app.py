@@ -7,6 +7,7 @@ import subprocess
 import shutil
 import io
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from dotenv import load_dotenv
 from pipeline_util import (
@@ -18,7 +19,10 @@ from pipeline_util import (
     SVG_OVERLAY_PROMPT,
 )
 
-# Popplerが実行可能かチェック
+# ==============================================================================
+# 環境依存バイナリ（Poppler）の初期化チェック
+# ==============================================================================
+# PDFページのレンダリングに必須となる pdftoppm の存在を確認
 if not shutil.which("pdftoppm") and get_poppler_path() is None:
     st.error("""
     ⚠️ **Poppler が見つかりません**
@@ -29,13 +33,17 @@ if not shutil.which("pdftoppm") and get_poppler_path() is None:
 
 load_dotenv()
 
-LAST_WORK_DIR_FILE = os.path.expanduser("~/.last_work_dir")
-LEGACY_PRESETS_FILE = "lecture_presets.json"
-FOLDER_CONFIG_FILENAME = "lecture_config.json"
-CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
-DEST_DIR = "exported_jpgs"
-PROMPTS_FILE = "custom_prompts.json"
+# ==============================================================================
+# 設定ファイル・ディレクトリ定数定義
+# ==============================================================================
+LAST_WORK_DIR_FILE = os.path.expanduser("~/.last_work_dir")  # 直前の作業フォルダパス永続化
+LEGACY_PRESETS_FILE = "lecture_presets.json"                # 過去バージョンとの下位互換用
+FOLDER_CONFIG_FILENAME = "lecture_config.json"              # 各講義フォルダ内に保存される設定
+CACHE_FILE = "exported_jpgs/ai_notes_cache.json"            # AI解説キャッシュ（Back画像ファイル名キー）
+DEST_DIR = "exported_jpgs"                                  # 中間JPEG画像出力先
+PROMPTS_FILE = "custom_prompts.json"                        # ユーザー定義プロンプト保存先
 
+# 公式ドキュメント準拠の正確な料金体系 (USD / 1M tokens)
 PRICING_MODELS = {
     "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
     "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
@@ -44,15 +52,19 @@ PRICING_MODELS = {
     "Gemini 4 Argon (12/1〜 通常)":         {"id": "gemini-4-argon",        "in": 4.00, "out": 20.00},
     "Gemini 2.5 Flash (レガシー)":          {"id": "gemini-2.5-flash",      "in": 0.30, "out": 2.50},
 }
-USD_JPY = 155.0
+USD_JPY = 155.0  # 為替レート換算基準
 
 
-# --- ~/.last_work_dir による最後の作業フォルダ記憶ヘルパー ---
+# ==============================================================================
+# フォルダ単位設定ロード・永続化ヘルパー (Exam2Anki設計準拠)
+# ==============================================================================
 def get_last_folder():
+    """~/.last_work_dir から直前に使用した講義フォルダパスを取得する"""
     if os.path.exists(LAST_WORK_DIR_FILE):
         try:
             with open(LAST_WORK_DIR_FILE, "r", encoding="utf-8") as f:
                 content = f.read().strip()
+            # プレーンテキスト形式（過去のJSON形式互換を含む）
             if content.startswith("{"):
                 bf = json.loads(content).get("last_base_folder", "")
             else:
@@ -61,6 +73,7 @@ def get_last_folder():
                 return bf
         except Exception:
             pass
+    # フォールバック: レガシー presets から先頭フォルダを引き継ぐ
     if os.path.exists(LEGACY_PRESETS_FILE):
         try:
             presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
@@ -73,6 +86,7 @@ def get_last_folder():
     return ""
 
 def save_last_folder(folder_path):
+    """~/.last_work_dir に作業ディレクトリをプレーンテキストで記録する"""
     if not folder_path:
         return
     try:
@@ -82,11 +96,13 @@ def save_last_folder(folder_path):
         pass
 
 
-# --- Masked PDF パスから Unmasked PDF パスを自動推論するヘルパー ---
+# ==============================================================================
+# PDFファイル名の自動判定およびペア推論ロジック
+# ==============================================================================
 def infer_unmasked_from_masked(masked_path):
     """
-    与えられた masked_path のファイル名（拡張子除く）から [_\s]+masked$ を除去し、
-    同一フォルダ内の対応する unmasked PDF パスを検出して返す。
+    与えられた masked_path のファイル名から [_\s]+masked$ を除去し、
+    同一フォルダ内に存在する対応する unmasked PDF の絶対パスを検出・推論する。
     """
     if not masked_path or not masked_path.strip():
         return ""
@@ -105,18 +121,17 @@ def infer_unmasked_from_masked(masked_path):
     if os.path.exists(candidate):
         return candidate
 
-    # フォルダ内で大文字小文字の違いを含めて一致するPDFを探す
+    # フォルダ内で拡張子やファイル名の大文字小文字の違いを含めて一致するPDFを探索
     if folder and os.path.isdir(folder):
         for f in os.listdir(folder):
             if f.lower() == f"{clean_stem}{ext}".lower():
                 return os.path.join(folder, f)
 
-    # まだファイルが存在しない場合でも推論した標準パスを返す
     return candidate
 
 
 def auto_detect_pdfs(folder_path):
-    """フォルダ内のPDFから unmasked / masked を自動推測する"""
+    """講義フォルダ内の全PDFから unmasked / masked の組み合わせを自動推測する"""
     if not folder_path or not os.path.isdir(folder_path):
         return "", ""
     pdfs = sorted(glob.glob(os.path.join(folder_path, "*.pdf")))
@@ -133,7 +148,10 @@ def auto_detect_pdfs(folder_path):
 
 
 def load_folder_config(folder_path):
-    """指定フォルダ内の lecture_config.json を読み込む。無ければ旧プリセットや自動検出で補完"""
+    """
+    講義フォルダ内の lecture_config.json を読み込む。
+    存在しない場合はフォルダ名および検出PDFから自動構成辞書を生成。
+    """
     if not folder_path:
         return {}
     cfg_path = os.path.join(folder_path, FOLDER_CONFIG_FILENAME)
@@ -143,6 +161,7 @@ def load_folder_config(folder_path):
         except Exception:
             pass
 
+    # 旧設定からのマイグレーション
     if os.path.exists(LEGACY_PRESETS_FILE):
         try:
             presets = json.load(open(LEGACY_PRESETS_FILE, "r", encoding="utf-8"))
@@ -164,7 +183,7 @@ def load_folder_config(folder_path):
     }
 
 def save_folder_config(folder_path, config_data):
-    """講義フォルダ直下に lecture_config.json を保存する"""
+    """講義フォルダ直下に lecture_config.json を保存し、直近パスも更新する"""
     if not folder_path or not os.path.isdir(folder_path):
         return False
     cfg_path = os.path.join(folder_path, FOLDER_CONFIG_FILENAME)
@@ -173,7 +192,7 @@ def save_folder_config(folder_path, config_data):
     return True
 
 def apply_folder_to_state(folder_path):
-    """フォルダ切り替え時に Session State 一式を更新する"""
+    """講義フォルダ変更時に Streamlit の session_state を同期更新する"""
     st.session_state.base_folder_val = folder_path
     cfg = load_folder_config(folder_path)
     u_default, m_default = auto_detect_pdfs(folder_path)
@@ -185,6 +204,9 @@ def apply_folder_to_state(folder_path):
     save_last_folder(folder_path)
 
 
+# ==============================================================================
+# AI解説キャッシュ管理 (exported_jpgs/ai_notes_cache.json)
+# ==============================================================================
 def get_ai_cache():
     return json.load(open(CACHE_FILE, "r", encoding="utf-8")) if os.path.exists(CACHE_FILE) else {}
 
@@ -192,8 +214,15 @@ def save_ai_cache(data):
     os.makedirs(DEST_DIR, exist_ok=True)
     json.dump(data, open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# --- 画像をmacOSクリップボードへコピーするヘルパー ---
+
+# ==============================================================================
+# macOS クリップボード連携 (AppKit NSPasteboard)
+# ==============================================================================
 def copy_image_to_clipboard_macos(image_path):
+    """
+    AppKit の NSImage / NSPasteboard を利用して JPEG 画像データを
+    完全な画像オブジェクトとして macOS クリップボードへ格納する（Cmd+V直接貼り付け対応）。
+    """
     abs_path = os.path.abspath(image_path)
     if not os.path.exists(abs_path):
         return False
@@ -211,7 +240,10 @@ def copy_image_to_clipboard_macos(image_path):
     res = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
     return res.returncode == 0
 
-# --- カスタムプロンプト保存・最新5件キープ用ヘルパー ---
+
+# ==============================================================================
+# プロンプト保存・履歴管理ヘルパー
+# ==============================================================================
 def get_prompt_store():
     if os.path.exists(PROMPTS_FILE):
         try:
@@ -224,6 +256,7 @@ def save_prompt_store(store):
     json.dump(store, open(PROMPTS_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 def keep_recent_prompt(p_text):
+    """直近使用されたカスタムプロンプトを最新5件までスタック保持する"""
     p_clean = p_text.strip()
     if not p_clean or p_clean in (DEFAULT_PROMPT, SVG_OVERLAY_PROMPT):
         return
@@ -233,7 +266,10 @@ def keep_recent_prompt(p_text):
     store["recent"] = recent[:5]
     save_prompt_store(store)
 
-# --- ファイル / フォルダ選択ダイアログ (macOS Finder: ~/.last_work_dir 起点) ---
+
+# ==============================================================================
+# macOS Finder ダイアログ連携 (AppleScript / osascript)
+# ==============================================================================
 def choose_folder_dialog(title="フォルダを選択", default_dir=None):
     target = default_dir or get_last_folder()
     if target and os.path.isdir(target):
@@ -252,9 +288,12 @@ def choose_file_dialog(title="ファイルを選択", default_dir=None):
     res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     return res.stdout.strip() if res.returncode == 0 else None
 
+
+# ==============================================================================
+# サムネイル高速化キャッシュ (幅200px固定 Base64変換)
+# ==============================================================================
 @st.cache_data(show_spinner=False)
 def get_thumb_b64(img_path, width=200):
-    """幅200px固定のサムネイルを生成してキャッシュする"""
     img = Image.open(img_path)
     w, h = img.size
     thumb = img.resize((width, int(h * (width / w))), Image.BILINEAR)
@@ -263,10 +302,13 @@ def get_thumb_b64(img_path, width=200):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+# ==============================================================================
+# Streamlit UI アプリケーション初期化
+# ==============================================================================
 st.set_page_config(page_title="PDF to Anki + AI Enhancer", layout="wide")
 st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 
-# --- 初回起動時のセッションステート初期化（最後に使ったフォルダの設定を自動ロード） ---
+# 初回起動時のセッションステート復元
 if "base_folder_val" not in st.session_state:
     init_bf = get_last_folder()
     if init_bf:
@@ -284,7 +326,6 @@ def on_base_folder_input_change():
     if bf and os.path.isdir(bf):
         apply_folder_to_state(bf)
 
-# Masked PDF テキストボックスが直接編集されたときに Unmasked を自動推論するコールバック
 def on_masked_input_change():
     m_val = st.session_state.masked_input_widget.strip()
     st.session_state.masked_pdf_val = m_val
@@ -295,7 +336,10 @@ def on_masked_input_change():
 def on_unmasked_input_change():
     st.session_state.unmasked_pdf_val = st.session_state.unmasked_input_widget.strip()
 
-# --- サイドバー: フォルダ起点の設定管理 (Exam2Anki方式) ---
+
+# ==============================================================================
+# サイドバー: 講義フォルダ起点の設定管理 (Exam2Anki方式)
+# ==============================================================================
 with st.sidebar:
     st.header("講義フォルダ・デッキ設定")
     
@@ -318,7 +362,7 @@ with st.sidebar:
             label_visibility="collapsed"
         )
 
-    # フォルダ内の設定ファイル有無をステータス表示
+    # フォルダ内設定ファイルの有無をステータス表示
     if base_folder and os.path.isdir(base_folder):
         cfg_file_in_dir = os.path.join(base_folder, FOLDER_CONFIG_FILENAME)
         if os.path.exists(cfg_file_in_dir):
@@ -352,12 +396,15 @@ with st.sidebar:
     st.markdown("---")
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
 
+# セッション状態変数の初期化
 if "slide_idx" not in st.session_state:
     st.session_state.slide_idx = 0
 if "custom_prompt_val" not in st.session_state:
     st.session_state.custom_prompt_val = DEFAULT_PROMPT
+if "selected_batch_slides" not in st.session_state:
+    st.session_state.selected_batch_slides = set()
 
-# 最新のタイムスタンプのバッチのみを自動抽出
+# 最新のタイムスタンプを持つJPEGバッチのみを抽出（過去バッチとの混在防止）
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
 if all_b_images:
     latest_ts = sorted({os.path.basename(f)[:17] for f in all_b_images})[-1]
@@ -367,15 +414,21 @@ else:
 
 ai_cache = get_ai_cache()
 
-# --- メインエリアのタブ構成 ---
+
+# ==============================================================================
+# メイン画面タブ構成
+# ==============================================================================
 tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
     "1. PDF指定", 
     "2. 💰 AI解説の一括追加", 
-    "3. 🔍 個別AI解説", 
+    "3. 🔍 個別AI解説 & 選択バッチ生成", 
     "4. 📦 Ankiパッケージ出力"
 ])
 
-# タブ 1: 抽出
+
+# ==============================================================================
+# タブ 1: PDFファイルの指定とJPEG書き出し
+# ==============================================================================
 with tab_extract:
     st.subheader("PDFファイルの指定とJPEG書き出し")
 
@@ -386,7 +439,7 @@ with tab_extract:
     is_masked_valid = True
 
     if mode == "事前Cloze済み (Masked PDFあり)":
-        # 1. 上段: Masked PDF パス（主選択）
+        # 1. 上段: Masked PDF パス（主導選択）
         st.markdown(
             "1️⃣ **マスク済みPDF (Masked) パス** <span style='color:#ef4444; font-size:12px;'>※これを選択すると下のUnmasked PDFを自動検出します</span>",
             unsafe_allow_html=True
@@ -414,7 +467,7 @@ with tab_extract:
             )
             st.session_state.masked_pdf_val = masked_pdf
 
-        # Masked PDF バリデーション
+        # Masked PDF 命名規則バリデーション
         masked_fn = os.path.basename(masked_pdf.strip()) if masked_pdf else ""
         if not masked_pdf or not masked_pdf.strip():
             st.warning("⚠️ 事前Clozeモードでは Masked PDF の指定が必須です。")
@@ -431,7 +484,7 @@ with tab_extract:
             if auto_u and os.path.exists(auto_u):
                 st.session_state.unmasked_pdf_val = auto_u
 
-        # 2. 下段: Unmasked PDF パス（自動検出 ＋ Manual Override 可能）
+        # 2. 下段: Unmasked PDF パス（自動補完 + 手動オーバーライド対応）
         u_exists = bool(st.session_state.unmasked_pdf_val and os.path.exists(st.session_state.unmasked_pdf_val))
         badge_html = (
             "<span style='color:#16a34a; font-size:12px;'>✅ 自動検出済 (手動変更も可)</span>"
@@ -457,7 +510,7 @@ with tab_extract:
             st.session_state.unmasked_pdf_val = unmasked_pdf
 
     else:
-        # 事後Cloze作成モード（Unmaskedのみ）
+        # 事後Cloze作成モード（Unmasked単体）
         st.markdown("**講義資料PDF (Unmasked) パス**")
         col_u1, col_u2 = st.columns([5, 1])
         with col_u2:
@@ -499,6 +552,7 @@ with tab_extract:
                             "masked_pdf": st.session_state.get("masked_pdf_val", ""),
                         })
                     ts, cnt = extract_pdf_pages(unmasked_pdf, masked_pdf if mode == "事前Cloze済み (Masked PDFあり)" else None, pages_str, pdf_pass)
+                    st.session_state.selected_batch_slides = set()
                     st.success(f"完了: {cnt} ページ分の画像（a/bペア）を exported_jpgs に書き出しました。")
                     st.rerun()
     
@@ -507,7 +561,10 @@ with tab_extract:
             os.makedirs(DEST_DIR, exist_ok=True)
             subprocess.run(["open", os.path.abspath(DEST_DIR)])
 
-# タブ 2: AI一括強化
+
+# ==============================================================================
+# タブ 2: AI一括強化 (全未処理スライドのシーケンシャル生成)
+# ==============================================================================
 with tab_ai_batch:
     st.subheader("Gemini Flash による一括スライドAI強化")
     unprocessed = [f for f in b_images if os.path.basename(f) not in ai_cache]
@@ -557,14 +614,21 @@ with tab_ai_batch:
     else:
         st.success("すべてのスライドのAI解説が完了済みです。")
 
-# タブ 3: 個別確認
+
+# ==============================================================================
+# タブ 3: 個別スライド確認 & 複数選択バッチ並列生成
+# ==============================================================================
 with tab_ai_inspect:
-    st.subheader("個別スライドの確認・プロンプト再生成 & 手動編集")
+    st.subheader("個別スライドの確認・プロンプト再生成 & 複数選択バッチ生成")
     if b_images:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
 
-        # --- ナビゲーションバー（上部に配置して移動しやすく） ---
+        # 現在のバッチ選択セットの整合性を検証
+        valid_fns = {os.path.basename(f) for f in b_images}
+        st.session_state.selected_batch_slides = st.session_state.selected_batch_slides.intersection(valid_fns)
+
+        # 上部ナビゲーションバー
         nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
         with nav_1:
             if st.button("⬅️ 前のスライド", key="btn_prev_slide", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
@@ -579,26 +643,70 @@ with tab_ai_inspect:
             fn = os.path.basename(target_img)
             st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
 
-        st.markdown("##### 🖼️ スライド一覧（アクティブスライドに追従）")
+        # 複数選択クイック操作バー
+        st.markdown("##### 🖼️ スライド一覧（アクティブ追従 ＋ 複数バッチ選択）")
+        sel_bar1, sel_bar2, sel_bar3, sel_bar4, sel_bar5 = st.columns([1.2, 1.1, 1, 1, 1.5])
+        with sel_bar1:
+            if st.button("⚪ 未処理のみ全選択", use_container_width=True):
+                unproc_fns = {os.path.basename(f) for f in b_images if os.path.basename(f) not in ai_cache}
+                st.session_state.selected_batch_slides = unproc_fns
+                for f_path in b_images:
+                    f_name = os.path.basename(f_path)
+                    st.session_state[f"chk_batch_{f_name}"] = (f_name in unproc_fns)
+                st.rerun()
+        with sel_bar2:
+            if st.button("☑️ 全スライド選択", use_container_width=True):
+                st.session_state.selected_batch_slides = set(valid_fns)
+                for f_name in valid_fns:
+                    st.session_state[f"chk_batch_{f_name}"] = True
+                st.rerun()
+        with sel_bar3:
+            if st.button("🔄 選択反転", use_container_width=True):
+                inverted = valid_fns - st.session_state.selected_batch_slides
+                st.session_state.selected_batch_slides = inverted
+                for f_name in valid_fns:
+                    st.session_state[f"chk_batch_{f_name}"] = (f_name in inverted)
+                st.rerun()
+        with sel_bar4:
+            if st.button("🗑️ 選択解除", use_container_width=True):
+                st.session_state.selected_batch_slides = set()
+                for f_name in valid_fns:
+                    st.session_state[f"chk_batch_{f_name}"] = False
+                st.rerun()
+        with sel_bar5:
+            sel_cnt = len(st.session_state.selected_batch_slides)
+            st.markdown(
+                f"<div style='padding-top:6px; text-align:right; font-weight:bold; color:#d97706;'>🎯 バッチ選択中: {sel_cnt} 枚</div>",
+                unsafe_allow_html=True
+            )
 
+        # サムネイルの動的表示ウィンドウ制御（選択スライドを見失わないための行算出）
         cols_per_row = 4
         total_rows = (total_slides + cols_per_row - 1) // cols_per_row
         current_row = st.session_state.slide_idx // cols_per_row
 
-        # アクティブスライドを中心として、前後1行（計3行分）を表示ウィンドウとする
         visible_rows_count = 3
         if total_rows <= visible_rows_count:
             start_row = 0
             end_row = total_rows
         else:
-            # 選択中の行が常に中央付近に来るようにウィンドウを移動
+            # 選択中の行が常に中央付近に来るようにウィンドウ範囲を追従
             start_row = max(0, min(current_row - 1, total_rows - visible_rows_count))
             end_row = min(total_rows, start_row + visible_rows_count)
 
         start_slide_num = start_row * cols_per_row + 1
         end_slide_num = min(total_slides, end_row * cols_per_row)
-        st.caption(f"表示中: スライド {start_slide_num} 〜 {end_slide_num} （全 {total_slides} 枚）")
+        st.caption(f"表示中: スライド {start_slide_num} 〜 {end_slide_num} （全 {total_slides} 枚） ※「対象」にチェックを入れて下の並列バッチを実行可能")
 
+        def make_chk_callback(slide_fn):
+            def _cb():
+                if st.session_state.get(f"chk_batch_{slide_fn}", False):
+                    st.session_state.selected_batch_slides.add(slide_fn)
+                else:
+                    st.session_state.selected_batch_slides.discard(slide_fn)
+            return _cb
+
+        # サムネイルカードグリッドの描画
         with st.container(border=True):
             for r_idx in range(start_row, end_row):
                 r_start = r_idx * cols_per_row
@@ -610,51 +718,74 @@ with tab_ai_inspect:
                         p_fn = os.path.basename(p_img)
                         has_ai = "✅" if p_fn in ai_cache else "⚪"
                         is_selected = (idx == st.session_state.slide_idx)
+                        is_batch_checked = (p_fn in st.session_state.selected_batch_slides)
                         b64_str = get_thumb_b64(p_img, width=200)
                         
+                        chk_key = f"chk_batch_{p_fn}"
+                        if chk_key not in st.session_state:
+                            st.session_state[chk_key] = is_batch_checked
+
                         with cols[c_idx]:
-                            # 選択中のスライドは目立つ枠線と背景色を付与
-                            border_color = "#2563eb" if is_selected else "#cbd5e1"
-                            bg_color = "#eff6ff" if is_selected else "#ffffff"
-                            box_shadow = "box-shadow: 0 0 0 2px #2563eb;" if is_selected else ""
+                            if is_selected:
+                                border_color = "#2563eb"
+                                bg_color = "#eff6ff"
+                                box_shadow = "box-shadow: 0 0 0 2px #2563eb;"
+                            elif is_batch_checked:
+                                border_color = "#f59e0b"
+                                bg_color = "#fffbeb"
+                                box_shadow = "box-shadow: 0 0 0 1px #f59e0b;"
+                            else:
+                                border_color = "#cbd5e1"
+                                bg_color = "#ffffff"
+                                box_shadow = ""
                             
                             st.markdown(
                                 f"""<div style="border: 2px solid {border_color}; background-color: {bg_color}; {box_shadow} border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
                                 unsafe_allow_html=True
                             )
                             st.markdown(f"![thumb](data:image/jpeg;base64,{b64_str})", unsafe_allow_html=True)
-                            btn_label = f"スライド {idx + 1} {has_ai}"
-                            if st.button(btn_label, key=f"slide_sel_{idx}", type="primary" if is_selected else "secondary", use_container_width=True):
-                                st.session_state.slide_idx = idx
-                                st.rerun()
+                            
+                            c_sub1, c_sub2 = st.columns([1, 1.5])
+                            with c_sub1:
+                                st.checkbox(
+                                    "対象",
+                                    key=chk_key,
+                                    on_change=make_chk_callback(p_fn),
+                                    help="バッチ生成の対象に含める"
+                                )
+                            with c_sub2:
+                                btn_label = f"#{idx + 1} {has_ai}"
+                                if st.button(btn_label, key=f"slide_sel_{idx}", type="primary" if is_selected else "secondary", use_container_width=True):
+                                    st.session_state.slide_idx = idx
+                                    st.rerun()
                                 
                             st.markdown("</div>", unsafe_allow_html=True)
 
-        nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
-        with nav_1:
-            if st.button("⬅️ 前のスライド", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
-                st.session_state.slide_idx -= 1
-                st.rerun()
-        with nav_3:
-            if st.button("次のスライド ➡️", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
-                st.session_state.slide_idx += 1
-                st.rerun()
-        with nav_2:
-            target_img = b_images[st.session_state.slide_idx]
-            fn = os.path.basename(target_img)
-            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
-
         st.markdown("---")
 
+        # 選択スライドの詳細表示・個別プロンプト操作エリア
         col_v1, col_v2 = st.columns([1, 1])
         with col_v1:
             st.image(target_img, caption=fn, use_container_width=True)
             
-            if st.button("📋 画像をクリップボードにコピー (for ChatGPT / Claude)", use_container_width=True):
-                if copy_image_to_clipboard_macos(target_img):
-                    st.toast("✅ 画像をクリップボードにコピーしました！外部チャットにそのまま貼り付け可能です。")
-                else:
-                    st.error("クリップボードへのコピーに失敗しました（macOS限定機能です）。")
+            c_act1, c_act2 = st.columns([1.4, 1])
+            with c_act1:
+                if st.button("📋 画像をクリップボードにコピー", use_container_width=True):
+                    if copy_image_to_clipboard_macos(target_img):
+                        st.toast("✅ 画像をクリップボードにコピーしました！")
+                    else:
+                        st.error("クリップボードへのコピーに失敗しました。")
+            with c_act2:
+                in_batch_now = (fn in st.session_state.selected_batch_slides)
+                toggle_lbl = "➖ バッチ対象から外す" if in_batch_now else "➕ バッチ対象に追加"
+                if st.button(toggle_lbl, use_container_width=True):
+                    if in_batch_now:
+                        st.session_state.selected_batch_slides.discard(fn)
+                        st.session_state[f"chk_batch_{fn}"] = False
+                    else:
+                        st.session_state.selected_batch_slides.add(fn)
+                        st.session_state[f"chk_batch_{fn}"] = True
+                    st.rerun()
 
         with col_v2:
             p_store = get_prompt_store()
@@ -734,16 +865,16 @@ with tab_ai_inspect:
                 st.components.v1.html(copy_btn_html, height=45)
 
             model_labels = list(PRICING_MODELS.keys())
-            default_idx = 0
+            default_idx = 1
             for idx, label in enumerate(model_labels):
-                if "2.5 Flash" in label:
+                if "3.6 Flash" in label:
                     default_idx = idx
                     break
 
             gen_c1, gen_c2 = st.columns([1.6, 1])
             with gen_c1:
                 sel_inspect_label = st.selectbox(
-                    "使用モデル（個別）",
+                    "使用モデル（個別・選択バッチ共通）",
                     model_labels,
                     index=default_idx,
                     label_visibility="collapsed"
@@ -760,9 +891,9 @@ with tab_ai_inspect:
             with gen_c2:
                 st.caption(f"💰 1枚推定: **約 {single_cost_jpy:.3f} 円** (`${single_cost_usd:.4f}`)")
 
-            if st.button("✨ このスライドのみAPI再生成 (Gemini)", type="primary", disabled=not api_key, use_container_width=True):
+            if st.button("✨ 表示中の1枚のみAPI生成 (Gemini)", disabled=not api_key, use_container_width=True):
                 keep_recent_prompt(custom_prompt)
-                with st.spinner(f"{fn} のAI解説を再生成中..."):
+                with st.spinner(f"{fn} のAI解説を生成中..."):
                     new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
                     ai_cache[fn] = new_html
                     save_ai_cache(ai_cache)
@@ -770,14 +901,66 @@ with tab_ai_inspect:
                     st.success("更新しました！")
                     st.rerun()
 
-        # --- 1. 現在のBack面AI解説プレビュー (Anki実機準拠 Lightテーマ + SVGオーバーレイ実画像対応) ---
+            # 複数選択バッチ並列実行コンテナ (ThreadPoolExecutor)
+            st.markdown("##### 🚀 選択したスライドをまとめて並列API生成")
+            selected_paths = [p for p in b_images if os.path.basename(p) in st.session_state.selected_batch_slides]
+            sel_count = len(selected_paths)
+            batch_cost_jpy = single_cost_jpy * sel_count
+            batch_cost_usd = single_cost_usd * sel_count
+
+            b_col1, b_col2 = st.columns([1.2, 1.8])
+            with b_col1:
+                max_workers = st.slider("同時並列数", min_value=1, max_value=5, value=3, help="並列数を上げると待ち時間を大幅に短縮できます（推奨: 3並列）")
+            with b_col2:
+                st.info(f"対象: **{sel_count} 枚** ｜ 推定合計: **約 {batch_cost_jpy:.2f} 円** (`${batch_cost_usd:.4f}`)")
+
+            if st.button(
+                f"🚀 選択した {sel_count} 枚を一括生成スタート ({max_workers}並列)",
+                type="primary",
+                disabled=(sel_count == 0 or not api_key),
+                use_container_width=True
+            ):
+                keep_recent_prompt(custom_prompt)
+                pbar = st.progress(0)
+                status_box = st.empty()
+                completed = 0
+                errors = []
+
+                def _worker(img_p):
+                    return os.path.basename(img_p), call_gemini_enhance(img_p, api_key, sel_inspect_model, custom_prompt)
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_path = {executor.submit(_worker, p): p for p in selected_paths}
+                    for future in as_completed(future_to_path):
+                        p_orig = future_to_path[future]
+                        f_name = os.path.basename(p_orig)
+                        try:
+                            res_fn, html_res = future.result()
+                            ai_cache[res_fn] = html_res
+                            save_ai_cache(ai_cache)
+                            st.session_state.pop(f"edit_html_{res_fn}", None)
+                            # 完了分はチェック解除
+                            st.session_state.selected_batch_slides.discard(res_fn)
+                            st.session_state[f"chk_batch_{res_fn}"] = False
+                        except Exception as exc:
+                            errors.append(f"{f_name}: {exc}")
+                        completed += 1
+                        pbar.progress(completed / sel_count)
+                        status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新完了 {f_name}")
+
+                if errors:
+                    st.error("一部のスライドでエラーが発生しました:\n" + "\n".join(errors))
+                else:
+                    status_box.success(f"🎉 選択した {sel_count} 枚のAI解説生成が完了しました！")
+                st.rerun()
+
+        # プレビュー表示エリア (SVGオーバーレイ Base64 置換対応)
         st.markdown("---")
         st.markdown("#### プレビュー (Anki Back面)")
         if fn in ai_cache:
             preview_html_body = ai_cache[fn]
             has_svg_overlay = ("<svg" in preview_html_body and "<img" in preview_html_body)
             
-            # SVGオーバーレイが含まれている場合、プレビューでも実画像が表示されるよう src を Base64 に動的置換
             if has_svg_overlay and os.path.exists(target_img):
                 with open(target_img, "rb") as img_f:
                     full_b64 = base64.b64encode(img_f.read()).decode("utf-8")
@@ -804,6 +987,33 @@ with tab_ai_inspect:
                     padding: 18px;
                     box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.08);
                     color: #1e293b !important;
+                }}
+                /* SVGオーバーレイ位置ずれ完全抑制リセット */
+                .svg-overlay-wrap {{
+                    position: relative !important;
+                    display: block !important;
+                    width: 100% !important;
+                    max-width: 850px !important;
+                    margin: 0 auto 16px auto !important;
+                    padding: 0 !important;
+                    line-height: 0 !important;
+                    font-size: 0 !important;
+                }}
+                .svg-overlay-wrap img {{
+                    width: 100% !important;
+                    height: auto !important;
+                    display: block !important;
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    border: none !important;
+                }}
+                .svg-overlay-wrap svg {{
+                    position: absolute !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    width: 100% !important;
+                    height: 100% !important;
+                    pointer-events: none !important;
                 }}
                 .ai-container {{
                     margin-top: 0;
@@ -890,7 +1100,7 @@ with tab_ai_inspect:
         else:
             st.info("このスライドにはまだAI解説がありません。APIで生成するか、下のテキストエリアから手動入力してください。")
 
-        # --- 2. 一番下: HTMLソースコードの直接編集・手動貼り付け用エリア ---
+        # HTMLソース手動編集・貼り付けエリア
         st.markdown("---")
         st.markdown("#### 📝 AI解説HTMLの直接編集・貼り付け (ChatGPT/Claudeなどの結果を反映)")
         
@@ -930,11 +1140,15 @@ with tab_ai_inspect:
                         st.info("AI解説を消去しました。")
                         st.rerun()
 
-# タブ 4: Ankiパッケージ出力
+
+# ==============================================================================
+# タブ 4: Ankiデッキパッケージ (.apkg) 出力
+# ==============================================================================
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
     st.write(f"出力先デッキ名: **{deck_name}**")
     
+    # 講義フォルダが設定されている場合はデフォルトの保存先にする
     bf = st.session_state.get("base_folder_val", "").strip()
     target_dir = bf if (bf and os.path.exists(bf)) else "."
     display_dir = os.path.abspath(target_dir)
