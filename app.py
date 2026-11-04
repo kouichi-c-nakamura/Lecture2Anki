@@ -564,11 +564,44 @@ with tab_ai_inspect:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
 
-        st.markdown("##### 🖼️ スライド一覧（幅200px固定サムネイル・クリックで選択）")
+        # --- ナビゲーションバー（上部に配置して移動しやすく） ---
+        nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
+        with nav_1:
+            if st.button("⬅️ 前のスライド", key="btn_prev_slide", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
+                st.session_state.slide_idx -= 1
+                st.rerun()
+        with nav_3:
+            if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
+                st.session_state.slide_idx += 1
+                st.rerun()
+        with nav_2:
+            target_img = b_images[st.session_state.slide_idx]
+            fn = os.path.basename(target_img)
+            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
 
-        with st.container(height=380, border=True):
-            cols_per_row = 4
-            for r_start in range(0, total_slides, cols_per_row):
+        st.markdown("##### 🖼️ スライド一覧（アクティブスライドに追従）")
+
+        cols_per_row = 4
+        total_rows = (total_slides + cols_per_row - 1) // cols_per_row
+        current_row = st.session_state.slide_idx // cols_per_row
+
+        # アクティブスライドを中心として、前後1行（計3行分）を表示ウィンドウとする
+        visible_rows_count = 3
+        if total_rows <= visible_rows_count:
+            start_row = 0
+            end_row = total_rows
+        else:
+            # 選択中の行が常に中央付近に来るようにウィンドウを移動
+            start_row = max(0, min(current_row - 1, total_rows - visible_rows_count))
+            end_row = min(total_rows, start_row + visible_rows_count)
+
+        start_slide_num = start_row * cols_per_row + 1
+        end_slide_num = min(total_slides, end_row * cols_per_row)
+        st.caption(f"表示中: スライド {start_slide_num} 〜 {end_slide_num} （全 {total_slides} 枚）")
+
+        with st.container(border=True):
+            for r_idx in range(start_row, end_row):
+                r_start = r_idx * cols_per_row
                 cols = st.columns(cols_per_row)
                 for c_idx in range(cols_per_row):
                     idx = r_start + c_idx
@@ -580,11 +613,13 @@ with tab_ai_inspect:
                         b64_str = get_thumb_b64(p_img, width=200)
                         
                         with cols[c_idx]:
+                            # 選択中のスライドは目立つ枠線と背景色を付与
                             border_color = "#2563eb" if is_selected else "#cbd5e1"
                             bg_color = "#eff6ff" if is_selected else "#ffffff"
+                            box_shadow = "box-shadow: 0 0 0 2px #2563eb;" if is_selected else ""
                             
                             st.markdown(
-                                f"""<div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
+                                f"""<div style="border: 2px solid {border_color}; background-color: {bg_color}; {box_shadow} border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
                                 unsafe_allow_html=True
                             )
                             st.markdown(f"![thumb](data:image/jpeg;base64,{b64_str})", unsafe_allow_html=True)
