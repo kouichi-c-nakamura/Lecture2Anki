@@ -18,11 +18,6 @@ from pipeline_util import (
     DEFAULT_PROMPT,
     SVG_OVERLAY_PROMPT,
 )
-from gemini_cdp import (
-    is_cdp_available,
-    launch_debug_chrome_macos,
-    execute_cdp_batch,
-)
 
 # ==============================================================================
 # 環境依存バイナリ（Poppler）の初期化チェック
@@ -278,7 +273,6 @@ def identify_prompt_label(p_text):
         return "🔄 Defaultプロンプト (標準解説・SVGなし)"
     if p_clean == SVG_OVERLAY_PROMPT.strip() or "svg-overlay-wrap" in p_clean:
         return "🎯 SVGオーバーレイ図示付きプロンプト"
-    # 保存済みプロンプト名との一致を確認
     store = get_prompt_store()
     for name, val in store.get("saved", {}).items():
         if val.strip() == p_clean:
@@ -326,7 +320,6 @@ def get_thumb_b64(img_path, width=200):
 # ==============================================================================
 @st.dialog("⚠️ バッチ生成の実行前確認", width="large")
 def confirm_batch_execution_dialog(
-    mode_type,
     selected_paths,
     all_b_images,
     prompt_text,
@@ -336,7 +329,6 @@ def confirm_batch_execution_dialog(
     est_cost_jpy,
     est_cost_usd,
     api_key,
-    cdp_url_input="",
 ):
     """
     バッチ処理を開始する前に、対象スライド・プロンプト種別・モデル・費用を
@@ -345,7 +337,6 @@ def confirm_batch_execution_dialog(
     prompt_type_str = identify_prompt_label(prompt_text)
     is_svg = "SVG" in prompt_type_str
 
-    # 選択されたスライド番号リストの作成
     idx_map = {os.path.basename(p): i + 1 for i, p in enumerate(all_b_images)}
     slide_nums = [f"#{idx_map.get(os.path.basename(p), '?')} ({os.path.basename(p)})" for p in selected_paths]
 
@@ -369,20 +360,13 @@ def confirm_batch_execution_dialog(
         unsafe_allow_html=True,
     )
 
-    # 3. 実行モードとコストの確認
+    # 3. 実行モデルとコストの確認
     st.markdown("---")
-    if mode_type == "api":
-        st.markdown(
-            f"- **実行方式:** Gemini API 並列実行 (**{max_workers} 並列**)\n"
-            f"- **使用モデル:** `{model_label}` (`{model_id}`)\n"
-            f"- **推定コスト:** **約 {est_cost_jpy:.2f} 円** (`${est_cost_usd:.4f}`)"
-        )
-    else:
-        st.markdown(
-            f"- **実行方式:** 🤖 Web版 Gemini App 自動操作 (Chrome CDP Port 9222)\n"
-            f"- **送信先URL:** `{cdp_url_input}`\n"
-            f"- **API費用:** **0 円** (実行中はMacのクリップボードを自動操作します)"
-        )
+    st.markdown(
+        f"- **実行方式:** Gemini API 並列実行 (**{max_workers} 並列**)\n"
+        f"- **使用モデル:** `{model_label}` (`{model_id}`)\n"
+        f"- **推定コスト:** **約 {est_cost_jpy:.2f} 円** (`${est_cost_usd:.4f}`)"
+    )
 
     col_ok, col_cancel = st.columns([1.5, 1])
     with col_ok:
@@ -398,59 +382,28 @@ def confirm_batch_execution_dialog(
         pbar = st.progress(0)
         status_box = st.empty()
         errors = []
+        completed = 0
 
-        if mode_type == "api":
-            completed = 0
+        def _worker(img_p):
+            return os.path.basename(img_p), call_gemini_enhance(img_p, api_key, model_id, prompt_text)
 
-            def _worker(img_p):
-                return os.path.basename(img_p), call_gemini_enhance(img_p, api_key, model_id, prompt_text)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_path = {executor.submit(_worker, p): p for p in selected_paths}
-                for future in as_completed(future_to_path):
-                    p_orig = future_to_path[future]
-                    f_name = os.path.basename(p_orig)
-                    try:
-                        res_fn, html_res = future.result()
-                        ai_cache_local[res_fn] = html_res
-                        save_ai_cache(ai_cache_local)
-                        st.session_state.pop(f"edit_html_{res_fn}", None)
-                        st.session_state.selected_batch_slides.discard(res_fn)
-                        st.session_state[f"chk_batch_{res_fn}"] = False
-                    except Exception as exc:
-                        errors.append(f"{f_name}: {exc}")
-                    completed += 1
-                    pbar.progress(completed / sel_count)
-                    status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新完了 {f_name}")
-        else:
-            enforced_prompt = prompt_text
-            if "```html" not in enforced_prompt:
-                enforced_prompt = (
-                    "【重要】出力の最初から最後までを必ず単一の ```html ... ``` コードブロック内に記述して出力してください。\n\n"
-                    + enforced_prompt
-                )
-
-            def _on_cdp_step(done_idx, total_cnt, slide_fn, html_out, err_msg):
-                if err_msg:
-                    errors.append(f"{slide_fn}: {err_msg}")
-                elif html_out:
-                    ai_cache_local[slide_fn] = html_out
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_path = {executor.submit(_worker, p): p for p in selected_paths}
+            for future in as_completed(future_to_path):
+                p_orig = future_to_path[future]
+                f_name = os.path.basename(p_orig)
+                try:
+                    res_fn, html_res = future.result()
+                    ai_cache_local[res_fn] = html_res
                     save_ai_cache(ai_cache_local)
-                    st.session_state.pop(f"edit_html_{slide_fn}", None)
-                    st.session_state.selected_batch_slides.discard(slide_fn)
-                    st.session_state[f"chk_batch_{slide_fn}"] = False
-                pbar.progress(done_idx / total_cnt)
-                status_box.text(f"Web版Gemini自動実行中 ({done_idx}/{total_cnt}): {slide_fn}")
-
-            try:
-                execute_cdp_batch(
-                    image_paths=selected_paths,
-                    prompt_text=enforced_prompt,
-                    target_url=cdp_url_input,
-                    on_progress=_on_cdp_step,
-                )
-            except Exception as e:
-                errors.append(f"CDP接続エラー: {e}")
+                    st.session_state.pop(f"edit_html_{res_fn}", None)
+                    st.session_state.selected_batch_slides.discard(res_fn)
+                    st.session_state[f"chk_batch_{res_fn}"] = False
+                except Exception as exc:
+                    errors.append(f"{f_name}: {exc}")
+                completed += 1
+                pbar.progress(completed / sel_count)
+                status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新完了 {f_name}")
 
         if errors:
             st.error("一部のスライドでエラーが発生しました:\n" + "\n".join(errors))
@@ -561,8 +514,6 @@ if "custom_prompt_val" not in st.session_state:
     st.session_state.custom_prompt_val = DEFAULT_PROMPT
 if "selected_batch_slides" not in st.session_state:
     st.session_state.selected_batch_slides = set()
-if "cdp_target_url" not in st.session_state:
-    st.session_state.cdp_target_url = "[https://gemini.google.com/app](https://gemini.google.com/app)"
 
 # 最新のタイムスタンプを持つJPEGバッチのみを抽出（過去バッチとの混在防止）
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
@@ -776,7 +727,7 @@ with tab_ai_batch:
 
 
 # ==============================================================================
-# タブ 3: 個別スライド確認 & 複数選択バッチ並列生成 (API & Chrome CDP対応)
+# タブ 3: 個別スライド確認 & 複数選択バッチ並列生成 (API完全一本化)
 # ==============================================================================
 with tab_ai_inspect:
     st.subheader("個別スライドの確認・プロンプト再生成 & 複数選択バッチ生成")
@@ -834,7 +785,6 @@ with tab_ai_inspect:
             return _cb
 
         # 2. 全スライドを内包する縦スクロール可能なサムネイルコンテナ (height=420)
-        # 各サムネイルに id="slide-card-{idx}" を付与し、前後のスライド移動時にJSで自動スクロール追従させる
         cols_per_row = 4
         with st.container(height=420, border=True):
             for r_start in range(0, total_slides, cols_per_row):
@@ -924,7 +874,7 @@ with tab_ai_inspect:
 
         st.markdown("---")
 
-        # 4. 選択スライドのプレビュー表示・個別プロンプト操作エリア
+        # 4. 選択スライドの詳細表示・個別プロンプト操作エリア
         col_v1, col_v2 = st.columns([1, 1])
         with col_v1:
             st.image(target_img, caption=fn, use_container_width=True)
@@ -1068,7 +1018,7 @@ with tab_ai_inspect:
                     st.rerun()
 
             # --- 複数選択バッチ並列実行コンテナ (実行前確認ダイアログ付き) ---
-            st.markdown("##### 🚀 方法A: 選択スライドをまとめて並列API生成")
+            st.markdown("##### 🚀 選択したスライドをまとめて並列API生成")
             selected_paths = [p for p in b_images if os.path.basename(p) in st.session_state.selected_batch_slides]
             sel_count = len(selected_paths)
             batch_cost_jpy = single_cost_jpy * sel_count
@@ -1087,7 +1037,6 @@ with tab_ai_inspect:
                 use_container_width=True
             ):
                 confirm_batch_execution_dialog(
-                    mode_type="api",
                     selected_paths=selected_paths,
                     all_b_images=b_images,
                     prompt_text=custom_prompt,
@@ -1098,49 +1047,6 @@ with tab_ai_inspect:
                     est_cost_usd=batch_cost_usd,
                     api_key=api_key,
                 )
-
-            # --- Web版Gemini自動実行コンテナ (Idea 2: Chrome CDP Port 9222) ---
-            with st.expander("🤖 方法B: Web版 Gemini App 自動操作 (Chrome CDP / API費用ゼロ)", expanded=False):
-                cdp_ok = is_cdp_available()
-                cdp_c1, cdp_c2 = st.columns([1.8, 1.2])
-                with cdp_c1:
-                    if cdp_ok:
-                        st.success("🟢 Chrome CDP (Port 9222) 接続可能")
-                    else:
-                        st.warning("🔴 Chrome (Port 9222) が未起動です")
-                with cdp_c2:
-                    if not cdp_ok:
-                        if st.button("🌐 デバッグ用Chromeを起動", use_container_width=True):
-                            launch_debug_chrome_macos(9222)
-                            st.toast("Chrome (Port 9222) を起動しました。Googleにログイン後、画面を更新してください。")
-
-                cdp_url_input = st.text_input(
-                    "送信先 Gemini / Custom Gem URL",
-                    key="cdp_target_url",
-                    help="通常の [https://gemini.google.com/app](https://gemini.google.com/app) または作成した Gem の URL を指定できます"
-                )
-
-                cdp_targets = selected_paths if sel_count > 0 else [target_img]
-                cdp_btn_label = (
-                    f"🤖 選択中の {sel_count} 枚をWeb版Geminiで自動生成 (¥0) ➔ 確認画面へ"
-                    if sel_count > 0 else
-                    f"🤖 表示中の1枚 ({fn}) をWeb版Geminiで自動生成 (¥0) ➔ 確認画面へ"
-                )
-
-                if st.button(cdp_btn_label, disabled=not cdp_ok, use_container_width=True):
-                    confirm_batch_execution_dialog(
-                        mode_type="cdp",
-                        selected_paths=cdp_targets,
-                        all_b_images=b_images,
-                        prompt_text=custom_prompt,
-                        model_label="Web版 Gemini App",
-                        model_id="gemini-web",
-                        max_workers=1,
-                        est_cost_jpy=0.0,
-                        est_cost_usd=0.0,
-                        api_key=api_key,
-                        cdp_url_input=cdp_url_input,
-                    )
 
         # プレビュー表示エリア (SVGオーバーレイ Base64 置換対応)
         st.markdown("---")
