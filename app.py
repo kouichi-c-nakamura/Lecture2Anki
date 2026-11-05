@@ -247,7 +247,7 @@ def copy_image_to_clipboard_macos(image_path):
 
 
 # ==============================================================================
-# プロンプト保存・履歴管理ヘルパー
+# プロンプト保存・履歴管理 & 種別判定ヘルパー
 # ==============================================================================
 def get_prompt_store():
     if os.path.exists(PROMPTS_FILE):
@@ -270,6 +270,20 @@ def keep_recent_prompt(p_text):
     recent.insert(0, p_clean)
     store["recent"] = recent[:5]
     save_prompt_store(store)
+
+def identify_prompt_label(p_text):
+    """現在選択されているプロンプトの種類を分かりやすくラベル化する"""
+    p_clean = p_text.strip()
+    if p_clean == DEFAULT_PROMPT.strip():
+        return "🔄 Defaultプロンプト (標準解説・SVGなし)"
+    if p_clean == SVG_OVERLAY_PROMPT.strip() or "svg-overlay-wrap" in p_clean:
+        return "🎯 SVGオーバーレイ図示付きプロンプト"
+    # 保存済みプロンプト名との一致を確認
+    store = get_prompt_store()
+    for name, val in store.get("saved", {}).items():
+        if val.strip() == p_clean:
+            return f"💾 保存済みプロンプト: 「{name}」"
+    return "✏️ カスタム編集プロンプト"
 
 
 # ==============================================================================
@@ -305,6 +319,145 @@ def get_thumb_b64(img_path, width=200):
     buf = io.BytesIO()
     thumb.save(buf, format="JPEG", quality=80)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# ==============================================================================
+# バッチ実行前の安全確認モーダルダイアログ (@st.dialog)
+# ==============================================================================
+@st.dialog("⚠️ バッチ生成の実行前確認", width="large")
+def confirm_batch_execution_dialog(
+    mode_type,
+    selected_paths,
+    all_b_images,
+    prompt_text,
+    model_label,
+    model_id,
+    max_workers,
+    est_cost_jpy,
+    est_cost_usd,
+    api_key,
+    cdp_url_input="",
+):
+    """
+    バッチ処理を開始する前に、対象スライド・プロンプト種別・モデル・費用を
+    ユーザーに明示して誤実行（プロンプト選び忘れやスライド選択ミス）を防止する。
+    """
+    prompt_type_str = identify_prompt_label(prompt_text)
+    is_svg = "SVG" in prompt_type_str
+
+    # 選択されたスライド番号リストの作成
+    idx_map = {os.path.basename(p): i + 1 for i, p in enumerate(all_b_images)}
+    slide_nums = [f"#{idx_map.get(os.path.basename(p), '?')} ({os.path.basename(p)})" for p in selected_paths]
+
+    st.markdown("以下の設定で一括AI解説生成を開始します。**スライドとプロンプトの選択に間違いがないか確認してください。**")
+
+    # 1. プロンプト種別の強調表示
+    if is_svg:
+        st.warning(f"**選択中のプロンプト:** {prompt_type_str}\n\n※画像上にSVG図形とラベルを重ねるモードです。")
+    else:
+        st.info(f"**選択中のプロンプト:** {prompt_type_str}")
+
+    with st.expander("📄 送信されるプロンプト全文を確認する", expanded=False):
+        st.code(prompt_text, language="text")
+
+    # 2. 対象スライド一覧の確認
+    st.markdown(f"**🎯 対象スライド ({len(selected_paths)} 枚):**")
+    st.markdown(
+        f"<div style='max-height: 110px; overflow-y: auto; background: #f8fafc; color: #1e293b; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px;'>"
+        + " , ".join(slide_nums)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # 3. 実行モードとコストの確認
+    st.markdown("---")
+    if mode_type == "api":
+        st.markdown(
+            f"- **実行方式:** Gemini API 並列実行 (**{max_workers} 並列**)\n"
+            f"- **使用モデル:** `{model_label}` (`{model_id}`)\n"
+            f"- **推定コスト:** **約 {est_cost_jpy:.2f} 円** (`${est_cost_usd:.4f}`)"
+        )
+    else:
+        st.markdown(
+            f"- **実行方式:** 🤖 Web版 Gemini App 自動操作 (Chrome CDP Port 9222)\n"
+            f"- **送信先URL:** `{cdp_url_input}`\n"
+            f"- **API費用:** **0 円** (実行中はMacのクリップボードを自動操作します)"
+        )
+
+    col_ok, col_cancel = st.columns([1.5, 1])
+    with col_ok:
+        run_confirmed = st.button("✅ はい、この設定で実行する", type="primary", use_container_width=True)
+    with col_cancel:
+        if st.button("キャンセル", use_container_width=True):
+            st.rerun()
+
+    if run_confirmed:
+        keep_recent_prompt(prompt_text)
+        ai_cache_local = get_ai_cache()
+        sel_count = len(selected_paths)
+        pbar = st.progress(0)
+        status_box = st.empty()
+        errors = []
+
+        if mode_type == "api":
+            completed = 0
+
+            def _worker(img_p):
+                return os.path.basename(img_p), call_gemini_enhance(img_p, api_key, model_id, prompt_text)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_path = {executor.submit(_worker, p): p for p in selected_paths}
+                for future in as_completed(future_to_path):
+                    p_orig = future_to_path[future]
+                    f_name = os.path.basename(p_orig)
+                    try:
+                        res_fn, html_res = future.result()
+                        ai_cache_local[res_fn] = html_res
+                        save_ai_cache(ai_cache_local)
+                        st.session_state.pop(f"edit_html_{res_fn}", None)
+                        st.session_state.selected_batch_slides.discard(res_fn)
+                        st.session_state[f"chk_batch_{res_fn}"] = False
+                    except Exception as exc:
+                        errors.append(f"{f_name}: {exc}")
+                    completed += 1
+                    pbar.progress(completed / sel_count)
+                    status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新完了 {f_name}")
+        else:
+            enforced_prompt = prompt_text
+            if "```html" not in enforced_prompt:
+                enforced_prompt = (
+                    "【重要】出力の最初から最後までを必ず単一の ```html ... ``` コードブロック内に記述して出力してください。\n\n"
+                    + enforced_prompt
+                )
+
+            def _on_cdp_step(done_idx, total_cnt, slide_fn, html_out, err_msg):
+                if err_msg:
+                    errors.append(f"{slide_fn}: {err_msg}")
+                elif html_out:
+                    ai_cache_local[slide_fn] = html_out
+                    save_ai_cache(ai_cache_local)
+                    st.session_state.pop(f"edit_html_{slide_fn}", None)
+                    st.session_state.selected_batch_slides.discard(slide_fn)
+                    st.session_state[f"chk_batch_{slide_fn}"] = False
+                pbar.progress(done_idx / total_cnt)
+                status_box.text(f"Web版Gemini自動実行中 ({done_idx}/{total_cnt}): {slide_fn}")
+
+            try:
+                execute_cdp_batch(
+                    image_paths=selected_paths,
+                    prompt_text=enforced_prompt,
+                    target_url=cdp_url_input,
+                    on_progress=_on_cdp_step,
+                )
+            except Exception as e:
+                errors.append(f"CDP接続エラー: {e}")
+
+        if errors:
+            st.error("一部のスライドでエラーが発生しました:\n" + "\n".join(errors))
+        else:
+            status_box.success(f"🎉 {sel_count} 枚のAI解説生成が完了しました！")
+            st.toast(f"✅ {sel_count} 枚のバッチ生成が完了しました！")
+            st.rerun()
 
 
 # ==============================================================================
@@ -409,7 +562,7 @@ if "custom_prompt_val" not in st.session_state:
 if "selected_batch_slides" not in st.session_state:
     st.session_state.selected_batch_slides = set()
 if "cdp_target_url" not in st.session_state:
-    st.session_state.cdp_target_url = "https://gemini.google.com/app"
+    st.session_state.cdp_target_url = "[https://gemini.google.com/app](https://gemini.google.com/app)"
 
 # 最新のタイムスタンプを持つJPEGバッチのみを抽出（過去バッチとの混在防止）
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
@@ -635,23 +788,8 @@ with tab_ai_inspect:
         valid_fns = {os.path.basename(f) for f in b_images}
         st.session_state.selected_batch_slides = st.session_state.selected_batch_slides.intersection(valid_fns)
 
-        # 上部ナビゲーションバー
-        nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
-        with nav_1:
-            if st.button("⬅️ 前のスライド", key="btn_prev_slide", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
-                st.session_state.slide_idx -= 1
-                st.rerun()
-        with nav_3:
-            if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
-                st.session_state.slide_idx += 1
-                st.rerun()
-        with nav_2:
-            target_img = b_images[st.session_state.slide_idx]
-            fn = os.path.basename(target_img)
-            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
-
-        # 複数選択クイック操作バー
-        st.markdown("##### 🖼️ スライド一覧（アクティブ追従 ＋ 複数バッチ選択）")
+        # 1. 複数選択クイック操作バー（サムネイルグリッドの直上）
+        st.markdown("##### 🖼️ スライド一覧（縦スクロール可 ＋ アクティブ自動追従 ＋ 複数バッチ選択）")
         sel_bar1, sel_bar2, sel_bar3, sel_bar4, sel_bar5 = st.columns([1.2, 1.1, 1, 1, 1.5])
         with sel_bar1:
             if st.button("⚪ 未処理のみ全選択", use_container_width=True):
@@ -687,24 +825,6 @@ with tab_ai_inspect:
                 unsafe_allow_html=True
             )
 
-        # サムネイルの動的表示ウィンドウ制御（選択スライドを見失わないための行算出）
-        cols_per_row = 4
-        total_rows = (total_slides + cols_per_row - 1) // cols_per_row
-        current_row = st.session_state.slide_idx // cols_per_row
-
-        visible_rows_count = 3
-        if total_rows <= visible_rows_count:
-            start_row = 0
-            end_row = total_rows
-        else:
-            # 選択中の行が常に中央付近に来るようにウィンドウ範囲を追従
-            start_row = max(0, min(current_row - 1, total_rows - visible_rows_count))
-            end_row = min(total_rows, start_row + visible_rows_count)
-
-        start_slide_num = start_row * cols_per_row + 1
-        end_slide_num = min(total_slides, end_row * cols_per_row)
-        st.caption(f"表示中: スライド {start_slide_num} 〜 {end_slide_num} （全 {total_slides} 枚） ※「対象」にチェックを入れて下の並列バッチまたはChrome自動実行を使用可能")
-
         def make_chk_callback(slide_fn):
             def _cb():
                 if st.session_state.get(f"chk_batch_{slide_fn}", False):
@@ -713,10 +833,11 @@ with tab_ai_inspect:
                     st.session_state.selected_batch_slides.discard(slide_fn)
             return _cb
 
-        # サムネイルカードグリッドの描画
-        with st.container(border=True):
-            for r_idx in range(start_row, end_row):
-                r_start = r_idx * cols_per_row
+        # 2. 全スライドを内包する縦スクロール可能なサムネイルコンテナ (height=420)
+        # 各サムネイルに id="slide-card-{idx}" を付与し、前後のスライド移動時にJSで自動スクロール追従させる
+        cols_per_row = 4
+        with st.container(height=420, border=True):
+            for r_start in range(0, total_slides, cols_per_row):
                 cols = st.columns(cols_per_row)
                 for c_idx in range(cols_per_row):
                     idx = r_start + c_idx
@@ -747,7 +868,7 @@ with tab_ai_inspect:
                                 box_shadow = ""
                             
                             st.markdown(
-                                f"""<div style="border: 2px solid {border_color}; background-color: {bg_color}; {box_shadow} border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
+                                f"""<div id="slide-card-{idx}" style="border: 2px solid {border_color}; background-color: {bg_color}; {box_shadow} border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
                                 unsafe_allow_html=True
                             )
                             st.markdown(f"![thumb](data:image/jpeg;base64,{b64_str})", unsafe_allow_html=True)
@@ -768,9 +889,42 @@ with tab_ai_inspect:
                                 
                             st.markdown("</div>", unsafe_allow_html=True)
 
+        # アクティブなサムネイルカードがスクロール枠内で常に見えるよう自動スクロール調整するJS
+        active_scroll_js = f"""
+        <script>
+            (function() {{
+                const targetId = "slide-card-{st.session_state.slide_idx}";
+                const attemptScroll = () => {{
+                    const el = window.parent.document.getElementById(targetId);
+                    if (el) {{
+                        el.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
+                    }}
+                }};
+                setTimeout(attemptScroll, 80);
+                setTimeout(attemptScroll, 250);
+            }})();
+        </script>
+        """
+        st.components.v1.html(active_scroll_js, height=0)
+
+        # 3. ナビゲーションバー（サムネイルの直下 かつ スライドプレビューの直上に配置）
+        nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
+        with nav_1:
+            if st.button("⬅️ 前のスライド", key="btn_prev_slide", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
+                st.session_state.slide_idx -= 1
+                st.rerun()
+        with nav_3:
+            if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
+                st.session_state.slide_idx += 1
+                st.rerun()
+        with nav_2:
+            target_img = b_images[st.session_state.slide_idx]
+            fn = os.path.basename(target_img)
+            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
+
         st.markdown("---")
 
-        # 選択スライドの詳細表示・個別プロンプト操作エリア
+        # 4. 選択スライドのプレビュー表示・個別プロンプト操作エリア
         col_v1, col_v2 = st.columns([1, 1])
         with col_v1:
             st.image(target_img, caption=fn, use_container_width=True)
@@ -845,10 +999,15 @@ with tab_ai_inspect:
                     use_container_width=True,
                 )
 
+            # 現在選択されているプロンプト種別を視覚的にバッジ表示
+            cur_prompt_label = identify_prompt_label(st.session_state.custom_prompt_val)
+            st.caption(f"現在のプロンプト設定: **{cur_prompt_label}**")
+
             custom_prompt = st.text_area(
                 "プロンプト（Default または 🎯SVG図示 を選択・編集可能）",
                 key="custom_prompt_val",
                 height=110,
+                label_visibility="collapsed",
             )
 
             sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1])
@@ -908,7 +1067,7 @@ with tab_ai_inspect:
                     st.success("更新しました！")
                     st.rerun()
 
-            # --- 複数選択バッチ並列実行コンテナ (Idea 1: ThreadPoolExecutor API) ---
+            # --- 複数選択バッチ並列実行コンテナ (実行前確認ダイアログ付き) ---
             st.markdown("##### 🚀 方法A: 選択スライドをまとめて並列API生成")
             selected_paths = [p for p in b_images if os.path.basename(p) in st.session_state.selected_batch_slides]
             sel_count = len(selected_paths)
@@ -922,44 +1081,23 @@ with tab_ai_inspect:
                 st.info(f"対象: **{sel_count} 枚** ｜ 推定合計: **約 {batch_cost_jpy:.2f} 円** (`${batch_cost_usd:.4f}`)")
 
             if st.button(
-                f"🚀 選択した {sel_count} 枚をAPI一括生成 ({max_workers}並列)",
+                f"🚀 選択した {sel_count} 枚をAPI一括生成 ({max_workers}並列) ➔ 確認画面へ",
                 type="primary",
                 disabled=(sel_count == 0 or not api_key),
                 use_container_width=True
             ):
-                keep_recent_prompt(custom_prompt)
-                pbar = st.progress(0)
-                status_box = st.empty()
-                completed = 0
-                errors = []
-
-                def _worker(img_p):
-                    return os.path.basename(img_p), call_gemini_enhance(img_p, api_key, sel_inspect_model, custom_prompt)
-
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_path = {executor.submit(_worker, p): p for p in selected_paths}
-                    for future in as_completed(future_to_path):
-                        p_orig = future_to_path[future]
-                        f_name = os.path.basename(p_orig)
-                        try:
-                            res_fn, html_res = future.result()
-                            ai_cache[res_fn] = html_res
-                            save_ai_cache(ai_cache)
-                            st.session_state.pop(f"edit_html_{res_fn}", None)
-                            # 完了分はチェック解除
-                            st.session_state.selected_batch_slides.discard(res_fn)
-                            st.session_state[f"chk_batch_{res_fn}"] = False
-                        except Exception as exc:
-                            errors.append(f"{f_name}: {exc}")
-                        completed += 1
-                        pbar.progress(completed / sel_count)
-                        status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新完了 {f_name}")
-
-                if errors:
-                    st.error("一部のスライドでエラーが発生しました:\n" + "\n".join(errors))
-                else:
-                    status_box.success(f"🎉 選択した {sel_count} 枚のAI解説生成が完了しました！")
-                st.rerun()
+                confirm_batch_execution_dialog(
+                    mode_type="api",
+                    selected_paths=selected_paths,
+                    all_b_images=b_images,
+                    prompt_text=custom_prompt,
+                    model_label=sel_inspect_label,
+                    model_id=sel_inspect_model,
+                    max_workers=max_workers,
+                    est_cost_jpy=batch_cost_jpy,
+                    est_cost_usd=batch_cost_usd,
+                    api_key=api_key,
+                )
 
             # --- Web版Gemini自動実行コンテナ (Idea 2: Chrome CDP Port 9222) ---
             with st.expander("🤖 方法B: Web版 Gemini App 自動操作 (Chrome CDP / API費用ゼロ)", expanded=False):
@@ -979,59 +1117,30 @@ with tab_ai_inspect:
                 cdp_url_input = st.text_input(
                     "送信先 Gemini / Custom Gem URL",
                     key="cdp_target_url",
-                    help="通常の https://gemini.google.com/app または作成した Gem の URL を指定できます"
+                    help="通常の [https://gemini.google.com/app](https://gemini.google.com/app) または作成した Gem の URL を指定できます"
                 )
 
-                # Web版は1枚のみ（現在のスライド）またはバッチ選択中のスライドのどちらにも対応
                 cdp_targets = selected_paths if sel_count > 0 else [target_img]
                 cdp_btn_label = (
-                    f"🤖 選択中の {sel_count} 枚をWeb版Geminiで順番に自動生成 (¥0)"
+                    f"🤖 選択中の {sel_count} 枚をWeb版Geminiで自動生成 (¥0) ➔ 確認画面へ"
                     if sel_count > 0 else
-                    f"🤖 表示中の1枚 ({fn}) をWeb版Geminiで自動生成 (¥0)"
+                    f"🤖 表示中の1枚 ({fn}) をWeb版Geminiで自動生成 (¥0) ➔ 確認画面へ"
                 )
 
                 if st.button(cdp_btn_label, disabled=not cdp_ok, use_container_width=True):
-                    keep_recent_prompt(custom_prompt)
-                    # コードブロック出力を強制するラッパー指示が付いていない場合は安全のため付加
-                    enforced_prompt = custom_prompt
-                    if "```html" not in enforced_prompt:
-                        enforced_prompt = (
-                            "【重要】出力の最初から最後までを必ず単一の ```html ... ``` コードブロック内に記述して出力してください。\n\n"
-                            + enforced_prompt
-                        )
-
-                    cdp_pbar = st.progress(0)
-                    cdp_status = st.empty()
-                    cdp_errors = []
-
-                    def _on_cdp_step(done_idx, total_cnt, slide_fn, html_out, err_msg):
-                        if err_msg:
-                            cdp_errors.append(f"{slide_fn}: {err_msg}")
-                        elif html_out:
-                            ai_cache[slide_fn] = html_out
-                            save_ai_cache(ai_cache)
-                            st.session_state.pop(f"edit_html_{slide_fn}", None)
-                            st.session_state.selected_batch_slides.discard(slide_fn)
-                            st.session_state[f"chk_batch_{slide_fn}"] = False
-                        cdp_pbar.progress(done_idx / total_cnt)
-                        cdp_status.text(f"Web版Gemini自動実行中 ({done_idx}/{total_cnt}): {slide_fn}")
-
-                    with st.spinner("Chrome (Port 9222) 上の Gemini App を自動操作中... (実行中はMacのクリップボードを使用します)"):
-                        try:
-                            execute_cdp_batch(
-                                image_paths=cdp_targets,
-                                prompt_text=enforced_prompt,
-                                target_url=cdp_url_input,
-                                on_progress=_on_cdp_step,
-                            )
-                        except Exception as e:
-                            st.error(f"CDP接続エラー: {e}")
-
-                    if cdp_errors:
-                        st.error("一部のスライドでエラーが発生しました:\n" + "\n".join(cdp_errors))
-                    else:
-                        cdp_status.success("🎉 Web版Geminiでの自動生成が完了しました！")
-                    st.rerun()
+                    confirm_batch_execution_dialog(
+                        mode_type="cdp",
+                        selected_paths=cdp_targets,
+                        all_b_images=b_images,
+                        prompt_text=custom_prompt,
+                        model_label="Web版 Gemini App",
+                        model_id="gemini-web",
+                        max_workers=1,
+                        est_cost_jpy=0.0,
+                        est_cost_usd=0.0,
+                        api_key=api_key,
+                        cdp_url_input=cdp_url_input,
+                    )
 
         # プレビュー表示エリア (SVGオーバーレイ Base64 置換対応)
         st.markdown("---")
