@@ -267,16 +267,28 @@ def keep_recent_prompt(p_text):
     save_prompt_store(store)
 
 def identify_prompt_label(p_text):
-    """現在選択されているプロンプトの種類を分かりやすくラベル化する"""
-    p_clean = p_text.strip()
-    if p_clean == DEFAULT_PROMPT.strip():
+    """現在選択されているプロンプトの種類を正確に判定してラベル化する"""
+    if not p_text:
+        return "（未入力）"
+    
+    # 改行や連続空白文字の違いによる不一致を防ぐため正規化
+    p_clean = " ".join(p_text.split())
+    default_clean = " ".join(DEFAULT_PROMPT.split())
+    svg_clean = " ".join(SVG_OVERLAY_PROMPT.split())
+
+    if p_clean == default_clean:
         return "🔄 Defaultプロンプト (標準解説・SVGなし)"
-    if p_clean == SVG_OVERLAY_PROMPT.strip() or "svg-overlay-wrap" in p_clean:
+    
+    # SVGオーバーレイ特有の指示文が含まれている場合のみSVGモードと判定
+    if p_clean == svg_clean or "SVGオーバーレイ" in p_text or "svg-overlay-wrap" in p_text:
         return "🎯 SVGオーバーレイ図示付きプロンプト"
+    
+    # 保存済みプロンプト名との一致を確認
     store = get_prompt_store()
     for name, val in store.get("saved", {}).items():
-        if val.strip() == p_clean:
+        if " ".join(val.split()) == p_clean:
             return f"💾 保存済みプロンプト: 「{name}」"
+            
     return "✏️ カスタム編集プロンプト"
 
 
@@ -335,7 +347,7 @@ def confirm_batch_execution_dialog(
     ユーザーに明示して誤実行（プロンプト選び忘れやスライド選択ミス）を防止する。
     """
     prompt_type_str = identify_prompt_label(prompt_text)
-    is_svg = "SVG" in prompt_type_str
+    is_svg = ("SVG" in prompt_type_str) and ("Default" not in prompt_type_str)
 
     idx_map = {os.path.basename(p): i + 1 for i, p in enumerate(all_b_images)}
     slide_nums = [f"#{idx_map.get(os.path.basename(p), '?')} ({os.path.basename(p)})" for p in selected_paths]
@@ -345,6 +357,8 @@ def confirm_batch_execution_dialog(
     # 1. プロンプト種別の強調表示
     if is_svg:
         st.warning(f"**選択中のプロンプト:** {prompt_type_str}\n\n※画像上にSVG図形とラベルを重ねるモードです。")
+    elif "Default" in prompt_type_str:
+        st.info(f"**選択中のプロンプト:** {prompt_type_str}\n\n※標準の箇条書き・表組み・カスケード解説を生成します（SVGなし）。")
     else:
         st.info(f"**選択中のプロンプト:** {prompt_type_str}")
 
@@ -960,7 +974,8 @@ with tab_ai_inspect:
                 label_visibility="collapsed",
             )
 
-            sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1])
+            # --- プロンプト保存・コピー操作バー ---
+            sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1.2])
             with sv_col1:
                 prompt_name = st.text_input("プロンプト保存名", placeholder="名前をつけて保存...", label_visibility="collapsed")
             with sv_col2:
@@ -978,7 +993,7 @@ with tab_ai_inspect:
                     📋 Promptコピー
                 </button>
                 """
-                st.components.v1.html(copy_btn_html, height=45)
+                st.components.v1.html(copy_btn_html, height=42)
 
             model_labels = list(PRICING_MODELS.keys())
             default_idx = 1
