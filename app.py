@@ -888,17 +888,23 @@ with tab_ai_inspect:
         # 3. ナビゲーションバー（サムネイル直下・プレビュー直上、「次のスライド」の左に「▢ 対象」を設置）
         target_img = b_images[st.session_state.slide_idx]
         fn = os.path.basename(target_img)
-        nav_chk_key = f"chk_batch_{fn}"
         is_cur_in_batch = (fn in st.session_state.selected_batch_slides)
 
-        def on_nav_batch_toggle():
-            val = st.session_state.get("nav_cur_batch_toggle", False)
-            if val:
-                st.session_state.selected_batch_slides.add(fn)
-                st.session_state[nav_chk_key] = True
-            else:
-                st.session_state.selected_batch_slides.discard(fn)
-                st.session_state[nav_chk_key] = False
+        # スライドごとに固有のキーを持たせることで、前後移動時に必ず正確なチェック状態が反映される
+        nav_widget_key = f"nav_chk_toggle_{fn}"
+        if nav_widget_key not in st.session_state:
+            st.session_state[nav_widget_key] = is_cur_in_batch
+
+        def on_nav_batch_toggle(slide_filename, widget_key):
+            def _cb():
+                val = st.session_state.get(widget_key, False)
+                if val:
+                    st.session_state.selected_batch_slides.add(slide_filename)
+                    st.session_state[f"chk_batch_{slide_filename}"] = True
+                else:
+                    st.session_state.selected_batch_slides.discard(slide_filename)
+                    st.session_state[f"chk_batch_{slide_filename}"] = False
+            return _cb
 
         nav_1, nav_2, nav_chk_col, nav_3 = st.columns([1.1, 2.5, 0.9, 1.1])
         with nav_1:
@@ -908,11 +914,12 @@ with tab_ai_inspect:
         with nav_2:
             st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
         with nav_chk_col:
+            # key にスライド名を含めることで、スライドが切り替わった瞬間にチェック状態が完全に連動する
             st.checkbox(
                 "🎯 対象",
                 value=is_cur_in_batch,
-                key="nav_cur_batch_toggle",
-                on_change=on_nav_batch_toggle,
+                key=nav_widget_key,
+                on_change=on_nav_batch_toggle(fn, nav_widget_key),
             )
         with nav_3:
             if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
