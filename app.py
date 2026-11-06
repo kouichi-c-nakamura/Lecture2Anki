@@ -753,6 +753,19 @@ with tab_ai_inspect:
         valid_fns = {os.path.basename(f) for f in b_images}
         st.session_state.selected_batch_slides = st.session_state.selected_batch_slides.intersection(valid_fns)
 
+        # チェックボックスの右横余白や高さを引き締める軽量CSSと、ホバー時に「一括処理の対象」を出す工夫
+        st.markdown("""
+        <style>
+            div[data-testid="stCheckbox"] {
+                margin-bottom: -8px !important;
+                padding-top: 4px !important;
+            }
+            div[data-testid="stCheckbox"] label {
+                min-height: 24px !important;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+
         # 1. 複数選択クイック操作バー（サムネイルグリッドの直上）
         st.markdown("##### 🖼️ スライド一覧（縦スクロール可 ＋ アクティブ自動追従 ＋ 複数バッチ選択）")
         sel_bar1, sel_bar2, sel_bar3, sel_bar4, sel_bar5 = st.columns([1.2, 1.1, 1, 1, 1.5])
@@ -786,7 +799,7 @@ with tab_ai_inspect:
         with sel_bar5:
             sel_cnt = len(st.session_state.selected_batch_slides)
             st.markdown(
-                f"<div style='padding-top:6px; text-align:right; font-weight:bold; color:#d97706;'>🎯 バッチ選択中: {sel_cnt} 枚</div>",
+                f"<div style='padding-top:6px; text-align:right; font-weight:bold; color:#f59e0b;'>🎯 バッチ選択中: {sel_cnt} 枚</div>",
                 unsafe_allow_html=True
             )
 
@@ -799,6 +812,8 @@ with tab_ai_inspect:
             return _cb
 
         # 2. 全スライドを内包する縦スクロール可能なサムネイルコンテナ (height=420)
+        # 不要な白い上部バーを完全廃止し、枠線は「一括処理対象(#f59e0b)」の一色のみに統一。
+        # 現在表示中のスライドは下のボタンの赤色(type="primary")のみで明快に表現する。
         cols_per_row = 4
         with st.container(height=420, border=True):
             for r_start in range(0, total_slides, cols_per_row):
@@ -818,51 +833,50 @@ with tab_ai_inspect:
                             st.session_state[chk_key] = is_batch_checked
 
                         with cols[c_idx]:
-                            if is_selected:
-                                border_color = "#2563eb"
-                                bg_color = "#eff6ff"
-                                box_shadow = "box-shadow: 0 0 0 2px #2563eb;"
-                            elif is_batch_checked:
-                                border_color = "#f59e0b"
-                                bg_color = "#fffbeb"
-                                box_shadow = "box-shadow: 0 0 0 1px #f59e0b;"
+                            # 枠線はバッチ対象のみオレンジ強調、それ以外は控えめな枠線
+                            if is_batch_checked:
+                                img_border = "border: 3px solid #f59e0b; box-shadow: 0 0 8px rgba(245, 158, 11, 0.45);"
                             else:
-                                border_color = "#cbd5e1"
-                                bg_color = "#ffffff"
-                                box_shadow = ""
+                                img_border = "border: 1px solid #475569;"
                             
+                            # 空divによる白いバー現象を防ぐため、<img>タグに直接 id と枠線スタイルを適用
                             st.markdown(
-                                f"""<div id="slide-card-{idx}" style="border: 2px solid {border_color}; background-color: {bg_color}; {box_shadow} border-radius: 6px; padding: 4px; margin-bottom: 6px; text-align: center;">""",
+                                f"""<img id="slide-card-{idx}" src="data:image/jpeg;base64,{b64_str}" title="スライド #{idx + 1} ({p_fn})" style="width: 100%; height: auto; display: block; border-radius: 6px; margin-bottom: 4px; {img_border}">""",
                                 unsafe_allow_html=True
                             )
-                            st.markdown(f"![thumb](data:image/jpeg;base64,{b64_str})", unsafe_allow_html=True)
                             
-                            c_sub1, c_sub2 = st.columns([1, 1.5])
+                            # 下部コントロール: 左にチェックボックス（文字・?マークなし）、右に選択ボタン
+                            c_sub1, c_sub2 = st.columns([0.55, 2.45])
                             with c_sub1:
                                 st.checkbox(
-                                    "対象",
+                                    "一括処理の対象",
                                     key=chk_key,
                                     on_change=make_chk_callback(p_fn),
-                                    help="バッチ生成の対象に含める"
+                                    label_visibility="collapsed"
                                 )
                             with c_sub2:
                                 btn_label = f"#{idx + 1} {has_ai}"
                                 if st.button(btn_label, key=f"slide_sel_{idx}", type="primary" if is_selected else "secondary", use_container_width=True):
                                     st.session_state.slide_idx = idx
                                     st.rerun()
-                                
-                            st.markdown("</div>", unsafe_allow_html=True)
 
-        # アクティブなサムネイルカードがスクロール枠内で常に見えるよう自動スクロール調整するJS
+        # アクティブなサムネイルカードへの自動スクロール追従 ＋ チェックボックスへのホバーtip付与JS
         active_scroll_js = f"""
         <script>
             (function() {{
                 const targetId = "slide-card-{st.session_state.slide_idx}";
                 const attemptScroll = () => {{
-                    const el = window.parent.document.getElementById(targetId);
+                    const pDoc = window.parent.document;
+                    const el = pDoc.getElementById(targetId);
                     if (el) {{
                         el.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
                     }}
+                    // チェックボックスに (?) アイコンを出さずにネイティブの hover tip (title属性) を付与
+                    pDoc.querySelectorAll('div[data-testid="stCheckbox"] label').forEach(lbl => {{
+                        if (!lbl.getAttribute('title')) {{
+                            lbl.setAttribute('title', '一括処理の対象');
+                        }}
+                    }});
                 }};
                 setTimeout(attemptScroll, 80);
                 setTimeout(attemptScroll, 250);
@@ -871,20 +885,39 @@ with tab_ai_inspect:
         """
         st.components.v1.html(active_scroll_js, height=0)
 
-        # 3. ナビゲーションバー（サムネイルの直下 かつ スライドプレビューの直上に配置）
-        nav_1, nav_2, nav_3 = st.columns([1, 3, 1])
+        # 3. ナビゲーションバー（サムネイル直下・プレビュー直上、「次のスライド」の左に「▢ 対象」を設置）
+        target_img = b_images[st.session_state.slide_idx]
+        fn = os.path.basename(target_img)
+        nav_chk_key = f"chk_batch_{fn}"
+        is_cur_in_batch = (fn in st.session_state.selected_batch_slides)
+
+        def on_nav_batch_toggle():
+            val = st.session_state.get("nav_cur_batch_toggle", False)
+            if val:
+                st.session_state.selected_batch_slides.add(fn)
+                st.session_state[nav_chk_key] = True
+            else:
+                st.session_state.selected_batch_slides.discard(fn)
+                st.session_state[nav_chk_key] = False
+
+        nav_1, nav_2, nav_chk_col, nav_3 = st.columns([1.1, 2.5, 0.9, 1.1])
         with nav_1:
             if st.button("⬅️ 前のスライド", key="btn_prev_slide", disabled=(st.session_state.slide_idx == 0), use_container_width=True):
                 st.session_state.slide_idx -= 1
                 st.rerun()
+        with nav_2:
+            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
+        with nav_chk_col:
+            st.checkbox(
+                "🎯 対象",
+                value=is_cur_in_batch,
+                key="nav_cur_batch_toggle",
+                on_change=on_nav_batch_toggle,
+            )
         with nav_3:
             if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), use_container_width=True):
                 st.session_state.slide_idx += 1
                 st.rerun()
-        with nav_2:
-            target_img = b_images[st.session_state.slide_idx]
-            fn = os.path.basename(target_img)
-            st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
 
         st.markdown("---")
 
@@ -1025,12 +1058,15 @@ with tab_ai_inspect:
             if st.button("✨ 表示中の1枚のみAPI生成 (Gemini)", disabled=not api_key, use_container_width=True):
                 keep_recent_prompt(custom_prompt)
                 with st.spinner(f"{fn} のAI解説を生成中..."):
-                    new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
-                    ai_cache[fn] = new_html
-                    save_ai_cache(ai_cache)
-                    st.session_state.pop(f"edit_html_{fn}", None)
-                    st.success("更新しました！")
-                    st.rerun()
+                    try:
+                        new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
+                        ai_cache[fn] = new_html
+                        save_ai_cache(ai_cache)
+                        st.session_state.pop(f"edit_html_{fn}", None)
+                        st.success("更新しました！")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"API通信エラーが発生しました: {e}")
 
             # --- 複数選択バッチ並列実行コンテナ (実行前確認ダイアログ付き) ---
             st.markdown("##### 🚀 選択したスライドをまとめて並列API生成")
