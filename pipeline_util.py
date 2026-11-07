@@ -1,8 +1,11 @@
 import os
 import re
+import csv
 import json
 import glob
 import shutil
+import time
+import zlib
 from datetime import datetime
 from PIL import Image
 import genanki
@@ -10,27 +13,27 @@ from pdf2image import convert_from_path, pdfinfo_from_path
 from google import genai
 from google.genai import types
 
+DEST_DIR = "exported_jpgs"
+MAX_IMAGE_LENGTH = 1600
+
+# Canonical Model schema locked across all lecture decks
+CANONICAL_MODEL_ID = 851727058
+CANONICAL_MODEL_NAME = "Medical AI Slide Model"
+
 def get_poppler_path():
     """環境に合わせて Poppler の実行バイナリパスを自動解決する"""
-    # 1. すでにシステム PATH が通っている場合 (Linux, CI, 一部のMac/Win)
     if shutil.which("pdftoppm"):
         return None
-    # 2. Apple Silicon Mac (Homebrew 標準)
     if os.path.exists("/opt/homebrew/bin/pdftoppm"):
         return "/opt/homebrew/bin"
-    # 3. Intel Mac (Homebrew 標準)
     if os.path.exists("/usr/local/bin/pdftoppm"):
         return "/usr/local/bin"
-    # 4. 見つからない場合は None (pdf2image 側の標準例外ハンドリングに任せる)
     return None
-
-MAX_IMAGE_LENGTH = 1600  # トークン爆発防止のため長辺を1600pxに制限
 
 # ==============================================================================
 # プロンプト定義
 # ==============================================================================
 
-# 共通の出力構成・要件（両プロンプトで同一の指示を使用）
 OUTPUT_REQUIREMENTS = r"""【構成・出力要件】
 1. 開始タグ:
    <div class="ai-title">テーマ名: 具体的な内容</div> で開始すること。
@@ -50,12 +53,10 @@ OUTPUT_REQUIREMENTS = r"""【構成・出力要件】
    - インライン数式: \( ... \)
    - ディスプレイ数式（別行立て）: \[ ... \]"""
 
-# UIで表示・編集・送信する標準ユーザープロンプト（初期値）
 DEFAULT_PROMPT = f"""この講義スライド画像を分析し、医学生の復習・国試・定期試験対策として直感的に理解できる「最高品質の補足解説」をHTML形式で作成してください。
 
 {OUTPUT_REQUIREMENTS}"""
 
-# SVGオーバーレイ図示付きの個別生成用プロンプト
 SVG_OVERLAY_REQUIREMENTS = r"""【SVGオーバーレイ図示の要件（最上部に配置）】
 0. スライド画像のSVGオーバーレイ図示:
    画像内の重要な解剖学的指標、病変部位、画像所見、病理組織学的特徴を視覚的にポインティングするため、解説の冒頭（<div class="ai-title">の前）に以下の構造でSVGオーバーレイラッパーを出力すること。
@@ -94,13 +95,12 @@ SVG_OVERLAY_PROMPT = f"""この講義スライド画像を分析し、医学生�
 
 {OUTPUT_REQUIREMENTS}"""
 
-# APIの system_instruction に渡すシステムプロンプト
 SYSTEM_PROMPT = f"""あなたは医学部専門の基礎医学・臨床医学の講師です。
 提供された講義スライド画像を分析し、医学生の復習・国試・定期試験対策として直感的に理解できる「最高品質の補足解説」をHTML形式で作成してください。
 
 【厳格な出力制約】
-1. マークダウンのコードブロック（```html ... ``` や ``` ... ```）は一切出力せず、直接埋め込み可能なHTMLタグ（div等）のみを出力すること。
-2. 数式を出力する際、$ や $$ は厳禁。必ず \(...\) または [ ... ] を用いること。
+1. マークダウンのコードブロック（```html ... ``` や ``` ... ```）は一切出力せず、直接埋め込み可能なHTMLタグのみを出力すること。
+2. 数式を出力する際、$ や $$ は厳禁。必ず \\(...\\) または [ ... ] を用いること。
 
 {OUTPUT_REQUIREMENTS}"""
 
@@ -116,6 +116,172 @@ CARD_CSS = """
 .ai-table td { padding: 8px; border-bottom: 1px solid #edf2f9; border-right: 1px solid #edf2f9; vertical-align: top; }
 """
 
+def get_canonical_model():
+    """全デッキ共通の単一・標準化されたノートモデル定義"""
+    return genanki.Model(
+        CANONICAL_MODEL_ID,
+        CANONICAL_MODEL_NAME,
+        fields=[{'name': 'Front'}, {'name': 'Back'}],
+        templates=[{'name': 'Card 1', 'qfmt': '{{Front}}', 'afmt': '{{Front}}<hr id="answer">{{Back}}'}],
+        css=CARD_CSS
+    )
+
+# ==============================================================================
+# Ankiエクスポート (.txt / TSV) からの作業状態復元ロジック
+# ==============================================================================
+def clean_extracted_back_html(back_html, b_img):
+    """
+    AnkiのBack列HTMLから外側の <img> やラッパー <div> を剥がし、
+    キャッシュに格納すべき純粋な解説HTML（またはSVG+解説HTML）を抽出する。
+    """
+    s = back_html.strip()
+    s = re.sub(r'^\s*<img\s+[^>]*src=["\']' + re.escape(b_img) + r'["\'][^>]*>\s*', '', s, count=1, flags=re.IGNORECASE).strip()
+    if not s:
+        return ""
+
+    svg_splits = re.split(r'(?=(?:<!--\s*ImageSize[^>]*-->\s*)?(?:<!--\s*パート1[^>]*-->\s*)?<div\s+class=["\']svg-overlay-wrap["\'])', s)
+    svg_splits = [part.strip() for part in svg_splits if part.strip()]
+    if len(svg_splits) > 1:
+        s = svg_splits[-1]
+
+    if s.startswith('<div class="ai-container">') and s.endswith('</div>'):
+        inner = s[len('<div class="ai-container">'):-len('</div>')].strip()
+        if '<div class="ai-container">' not in inner:
+            s = inner
+
+    return s
+
+def restore_from_anki_export(
+    export_txt_path,
+    collection_media_dir=None,
+    dest_dir="exported_jpgs",
+):
+    if not collection_media_dir:
+        collection_media_dir = os.path.expanduser("~/Library/Application Support/Anki2/User 1/collection.media")
+
+    os.makedirs(dest_dir, exist_ok=True)
+    for old_img in glob.glob(os.path.join(dest_dir, "*.jpg")) + glob.glob(os.path.join(dest_dir, "*.png")):
+        try:
+            os.remove(old_img)
+        except Exception:
+            pass
+
+    cache_file = os.path.join(dest_dir, "ai_notes_cache.json")
+    guid_map_file = os.path.join(dest_dir, "guid_map.json")
+
+    ai_cache = json.load(open(cache_file, "r", encoding="utf-8")) if os.path.exists(cache_file) else {}
+    guid_map_data = {
+        "deck_name": "",
+        "notetype_name": CANONICAL_MODEL_NAME,
+        "notes": {}
+    }
+
+    col_idx = {"guid": 0, "notetype": 1, "deck": 2, "front": 3, "back": 4, "tags": 5}
+    has_explicit_headers = False
+
+    copied_count = 0
+    missing_images = []
+    restored_notes_count = 0
+    restored_ai_count = 0
+
+    with open(export_txt_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter="\t")
+        for row in reader:
+            if not row:
+                continue
+            first_cell = row[0].strip()
+            if first_cell.startswith("#"):
+                m_guid = re.match(r'^#guid column:(\d+)', first_cell)
+                m_type = re.match(r'^#notetype column:(\d+)', first_cell)
+                m_deck = re.match(r'^#deck column:(\d+)', first_cell)
+                m_tags = re.match(r'^#tags column:(\d+)', first_cell)
+                if m_guid:
+                    col_idx["guid"] = int(m_guid.group(1)) - 1
+                    has_explicit_headers = True
+                elif m_type:
+                    col_idx["notetype"] = int(m_type.group(1)) - 1
+                    has_explicit_headers = True
+                elif m_deck:
+                    col_idx["deck"] = int(m_deck.group(1)) - 1
+                    has_explicit_headers = True
+                elif m_tags:
+                    col_idx["tags"] = int(m_tags.group(1)) - 1
+                    has_explicit_headers = True
+                continue
+
+            if has_explicit_headers:
+                meta_cols = {col_idx["guid"], col_idx["notetype"], col_idx["deck"]}
+                field_cols = [i for i in range(len(row)) if i not in meta_cols and i != col_idx.get("tags", -1)]
+                if len(field_cols) >= 2:
+                    col_idx["front"], col_idx["back"] = field_cols[0], field_cols[1]
+
+            if len(row) <= max(col_idx["front"], col_idx["back"]):
+                continue
+
+            guid = row[col_idx["guid"]].strip()
+            deck_val = row[col_idx["deck"]].strip() if col_idx["deck"] < len(row) else ""
+            front_html = row[col_idx["front"]].strip()
+            back_html = row[col_idx["back"]].strip()
+            tags_str = row[col_idx["tags"]].strip() if col_idx["tags"] < len(row) else ""
+
+            if deck_val and not guid_map_data["deck_name"]:
+                guid_map_data["deck_name"] = deck_val
+
+            all_imgs = re.findall(r'<img\s+[^>]*src=["\']([^"\']+)["\']', front_html + " " + back_html, flags=re.IGNORECASE)
+            for img_fn in set(all_imgs):
+                src_p = os.path.join(collection_media_dir, img_fn)
+                dst_p = os.path.join(dest_dir, img_fn)
+                if os.path.exists(src_p):
+                    shutil.copy2(src_p, dst_p)
+                    copied_count += 1
+                elif not os.path.exists(dst_p):
+                    missing_images.append(img_fn)
+
+            f_match = re.search(r'<img\s+[^>]*src=["\']([^"\']+a\.(?:jpg|jpeg|png))["\']', front_html, flags=re.IGNORECASE)
+            b_match = re.search(r'<img\s+[^>]*src=["\']([^"\']+b\.(?:jpg|jpeg|png))["\']', back_html, flags=re.IGNORECASE)
+            if not b_match and f_match:
+                b_img = re.sub(r'a\.(jpg|jpeg|png)$', r'b.\1', f_match.group(1), flags=re.IGNORECASE)
+            elif b_match:
+                b_img = b_match.group(1)
+            else:
+                continue
+
+            f_img = f_match.group(1) if f_match else re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_img, flags=re.IGNORECASE)
+
+            guid_map_data["notes"][b_img] = {
+                "guid": guid,
+                "f_img": f_img,
+                "b_img": b_img,
+                "front_html": front_html,
+                "tags": tags_str.split() if tags_str else []
+            }
+            restored_notes_count += 1
+
+            clean_ai = clean_extracted_back_html(back_html, b_img)
+            if clean_ai:
+                ai_cache[b_img] = clean_ai
+                restored_ai_count += 1
+            else:
+                ai_cache.pop(b_img, None)
+
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(ai_cache, f, ensure_ascii=False, indent=2)
+
+    with open(guid_map_file, "w", encoding="utf-8") as f:
+        json.dump(guid_map_data, f, ensure_ascii=False, indent=2)
+
+    return {
+        "deck_name": guid_map_data["deck_name"],
+        "notetype_name": CANONICAL_MODEL_NAME,
+        "restored_notes": restored_notes_count,
+        "restored_ai": restored_ai_count,
+        "copied_images": copied_count,
+        "missing_images": sorted(set(missing_images)),
+    }
+
+# ==============================================================================
+# PDF抽出 & Gemini API呼び出し & APKGビルド
+# ==============================================================================
 def parse_pages(page_str, total_pages):
     if not page_str or page_str.strip() == "all":
         return list(range(1, total_pages + 1))
@@ -131,7 +297,11 @@ def parse_pages(page_str, total_pages):
 
 def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password="", dpi=200, dest_dir="exported_jpgs"):
     os.makedirs(dest_dir, exist_ok=True)
-    poppler_bin = get_poppler_path()  # ここで動的取得
+    poppler_bin = get_poppler_path()
+
+    guid_map_file = os.path.join(dest_dir, "guid_map.json")
+    if os.path.exists(guid_map_file):
+        os.remove(guid_map_file)
 
     info = pdfinfo_from_path(unmasked_pdf, poppler_path=poppler_bin, userpw=password)
     total_pages = info["Pages"]
@@ -161,6 +331,15 @@ def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None):
     client = genai.Client(api_key=api_key)
     img = Image.open(img_path)
     prompt = custom_prompt or DEFAULT_PROMPT
+
+    if "svg-overlay-wrap" in prompt:
+        w, h = img.size
+        target_h = int(round(1000 * h / w))
+        prompt = re.sub(
+            r'(<svg\s+viewBox=["\']0\s+0\s+1000\s+)\d+(["\'])',
+            rf'\g<1>{target_h}\g<2>',
+            prompt
+        )
     
     response = client.models.generate_content(
         model=model_id,
@@ -180,10 +359,25 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
     files = sorted(glob.glob(os.path.join(dest_dir, "*.jpg")))
     if not files:
         return "", 0
-    
-    # フォルダ内に残っている中で最新のタイムスタンプのファイルだけに限定
-    latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
-    files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
+
+    guid_map_file = os.path.join(dest_dir, "guid_map.json")
+    guid_map_data = {}
+    if os.path.exists(guid_map_file):
+        try:
+            guid_map_data = json.load(open(guid_map_file, "r", encoding="utf-8"))
+        except Exception:
+            guid_map_data = {}
+
+    notes_meta = guid_map_data.get("notes", {})
+    effective_deck_name = deck_name.strip() or guid_map_data.get("deck_name", "Default_Deck")
+
+    # 対象画像の抽出（guid_mapがある場合はその対象ノートの画像、無ければ最新タイムスタンプ）
+    if notes_meta:
+        target_fns = {m["f_img"] for m in notes_meta.values()} | {m["b_img"] for m in notes_meta.values()}
+        files = [f for f in files if os.path.basename(f) in target_fns]
+    else:
+        latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
+        files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
     
     pairs = {}
     pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{6})_(\d{3})([ab])\.jpg')
@@ -197,34 +391,40 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
                 pairs[key] = {"page": page_num}
             pairs[key][m.group(3)] = f
 
-    model_id = abs(hash("Medical_Card_Model_V2")) % (10**9)
-    deck_id = abs(hash(deck_name)) % (10**9)
-
-    model = genanki.Model(
-        model_id,
-        'Medical AI Slide Model',
-        fields=[{'name': 'Front'}, {'name': 'Back'}],
-        templates=[{'name': 'Card 1', 'qfmt': '{{Front}}', 'afmt': '{{Front}}<hr id="answer">{{Back}}'}],
-        css=CARD_CSS
-    )
-    deck = genanki.Deck(deck_id, deck_name)
+    # 共通の標準モデルと決定論的デッキID
+    model = get_canonical_model()
+    deck_id = zlib.crc32(effective_deck_name.encode("utf-8"))
+    deck = genanki.Deck(deck_id, effective_deck_name)
     media_list = []
+
+    # Ankiが「新しいノート」と認識するように現時刻タイムスタンプを明示
+    current_timestamp = int(time.time())
 
     for key, data in sorted(pairs.items()):
         if 'a' in data and 'b' in data:
             f_img = os.path.basename(data['a'])
             b_img = os.path.basename(data['b'])
+            meta = notes_meta.get(b_img, {})
+
+            if meta.get("front_html"):
+                front_html = meta["front_html"]
+            else:
+                p_label = f"{group_title} p.{data['page']}" if group_title else f"p.{data['page']}"
+                front_html = f'<div style="text-align:center;font-size:13px;color:#888;">{p_label}</div><img src="{f_img}">'
             
-            p_label = f"{group_title} p.{data['page']}" if group_title else f"p.{data['page']}"
-            front_html = f'<div style="text-align:center;font-size:13px;color:#888;">{p_label}</div><img src="{f_img}">'
-            
-            ai_body = ai_cache.get(b_img, "") if ai_cache else ""
+            ai_body = ai_cache.get(b_img, "").strip() if ai_cache else ""
             if "<svg" in ai_body and "<img" in ai_body:
-                # SVGオーバーレイ付きの解説なら、内部の <img> の src を実際の b_img ファイル名に自動置換し、外側の <img> 重複出力を防ぐ
+                ai_body_clean = re.sub(
+                    r'^\s*<img\s+[^>]*src=["\']' + re.escape(b_img) + r'["\'][^>]*>\s*',
+                    '',
+                    ai_body,
+                    count=1,
+                    flags=re.IGNORECASE
+                ).strip()
                 ai_body_fixed = re.sub(
                     r'(<img\s+[^>]*src=["\'])([^"\']+)(["\'])',
                     rf'\g<1>{b_img}\g<3>',
-                    ai_body,
+                    ai_body_clean,
                     count=1
                 )
                 back_html = f'<div class="ai-container">{ai_body_fixed}</div>'
@@ -232,13 +432,15 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
                 ai_html = f'<div class="ai-container">{ai_body}</div>' if ai_body else ""
                 back_html = f'<img src="{b_img}">{ai_html}'
 
-            guid = genanki.guid_for(f"{deck_name}_{data['page']}")
-            note = genanki.Note(model=model, fields=[front_html, back_html], guid=guid)
+            guid = meta.get("guid") or genanki.guid_for(f"{effective_deck_name}_{data['page']}")
+            tags = meta.get("tags", [])
+            note = genanki.Note(model=model, fields=[front_html, back_html], guid=guid, tags=tags)
+            note.mod = current_timestamp
             deck.add_note(note)
 
             media_list.extend([data['a'], data['b']])
 
-    filename = f"{deck_name.replace('::', '_').replace('/', '_')}.apkg"
+    filename = f"{effective_deck_name.replace('::', '_').replace('/', '_')}.apkg"
     target_dir = output_dir if (output_dir and os.path.exists(output_dir)) else "."
     out_apkg = os.path.join(target_dir, filename)
 

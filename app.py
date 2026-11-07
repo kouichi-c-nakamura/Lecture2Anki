@@ -15,6 +15,7 @@ from pipeline_util import (
     call_gemini_enhance,
     build_apkg,
     get_poppler_path,
+    restore_from_anki_export,  # ← 追加
     DEFAULT_PROMPT,
     SVG_OVERLAY_PROMPT,
 )
@@ -530,12 +531,22 @@ if "selected_batch_slides" not in st.session_state:
     st.session_state.selected_batch_slides = set()
 
 # 最新のタイムスタンプを持つJPEGバッチのみを抽出（過去バッチとの混在防止）
+# guid_map.json（Anki復元データ）がある場合はその対象リストを優先し、無ければ最新タイムスタンプを採用
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
-if all_b_images:
+guid_map_path = os.path.join(DEST_DIR, "guid_map.json")
+b_images = []
+
+if os.path.exists(guid_map_path):
+    try:
+        gm_notes = json.load(open(guid_map_path, "r", encoding="utf-8")).get("notes", {})
+        if gm_notes:
+            b_images = [f for f in all_b_images if os.path.basename(f) in gm_notes]
+    except Exception:
+        pass
+
+if not b_images and all_b_images:
     latest_ts = sorted({os.path.basename(f)[:17] for f in all_b_images})[-1]
     b_images = [f for f in all_b_images if os.path.basename(f).startswith(latest_ts)]
-else:
-    b_images = []
 
 ai_cache = get_ai_cache()
 
@@ -653,6 +664,68 @@ with tab_extract:
                 label_visibility="collapsed"
             )
             st.session_state.unmasked_pdf_val = unmasked_pdf
+                
+    st.markdown("---")
+    st.subheader("🔄 既存Ankiデッキ（ノート書き出し .txt）からの作業状態復元")
+    st.caption("Ankiで「ノート (テキスト形式) (.txt)」（HTMLとメディア参照＋一意の識別子を含める）として書き出したファイルと、`collection.media` から作業状態を再現します。")
+
+    if "anki_txt_path_val" not in st.session_state:
+        default_txt = os.path.abspath("ブロック1_肝胆膵疾患__3 胆膵の画像診断.txt")
+        st.session_state.anki_txt_path_val = default_txt if os.path.exists(default_txt) else ""
+    if "anki_media_dir_val" not in st.session_state:
+        st.session_state.anki_media_dir_val = os.path.expanduser("~/Library/Application Support/Anki2/User 1/collection.media")
+
+    col_r1, col_r2 = st.columns([5, 1])
+    with col_r2:
+        if st.button("📄 .txt選択", key="btn_choose_anki_txt", use_container_width=True):
+            chosen_txt = choose_file_dialog("Ankiノート書き出し (.txt) を選択", default_dir=st.session_state.get("base_folder_val"))
+            if chosen_txt:
+                st.session_state.anki_txt_path_val = chosen_txt
+                st.rerun()
+    with col_r1:
+        anki_txt_path = st.text_input("Ankiエクスポート (.txt) パス", key="anki_txt_path_val")
+
+    anki_media_dir = st.text_input("Anki collection.media フォルダパス", key="anki_media_dir_val")
+
+    # ウィジェット描画前に実行される on_click コールバック関数
+    def on_restore_anki_click():
+        txt_p = st.session_state.get("anki_txt_path_val", "").strip()
+        med_d = st.session_state.get("anki_media_dir_val", "").strip()
+        if not txt_p or not os.path.exists(txt_p):
+            st.session_state.restore_msg = ("error", f"エクスポートファイルが見つかりません: `{txt_p}`")
+            return
+        if not med_d or not os.path.isdir(med_d):
+            st.session_state.restore_msg = ("error", f"collection.media フォルダが見つかりません: `{med_d}`")
+            return
+
+        res = restore_from_anki_export(txt_p, med_d, DEST_DIR)
+        if res["deck_name"]:
+            # on_click 内であればサイドバーの widget key も安全に書き換え可能
+            st.session_state.deck_name_val = res["deck_name"]
+            st.session_state.group_title_val = res["deck_name"].split("::")[-1]
+        st.session_state.selected_batch_slides = set()
+        st.session_state.slide_idx = 0
+        st.session_state.restore_msg = ("success", res)
+
+    st.button(
+        "♻️ Ankiエクスポートから画像・既存AI解説・GUIDを復元",
+        type="primary",
+        on_click=on_restore_anki_click,
+    )
+
+    # 実行結果メッセージの表示
+    if "restore_msg" in st.session_state:
+        msg_type, payload = st.session_state.pop("restore_msg")
+        if msg_type == "error":
+            st.error(payload)
+        elif msg_type == "success":
+            st.success(
+                f"🎉 復元完了！ ノート: **{payload['restored_notes']} 枚** (GUID保持) ｜ "
+                f"既存AI解説: **{payload['restored_ai']} 件** ｜ "
+                f"コピー画像: **{payload['copied_images']} 枚**"
+            )
+            if payload["missing_images"]:
+                st.warning(f"一部の画像が collection.media 内に見つかりませんでした: {payload['missing_images']}")  
 
     pages_str = st.text_input("対象ページ (例: 1-10, 14, 25 または all)", value="all")
 
