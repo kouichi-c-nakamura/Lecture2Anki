@@ -184,85 +184,97 @@ def restore_from_anki_export(
     restored_notes_count = 0
     restored_ai_count = 0
 
-    with open(export_txt_path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f, delimiter="\t")
-        for row in reader:
-            if not row:
-                continue
-            first_cell = row[0].strip()
-            if first_cell.startswith("#"):
-                m_guid = re.match(r'^#guid column:(\d+)', first_cell)
-                m_type = re.match(r'^#notetype column:(\d+)', first_cell)
-                m_deck = re.match(r'^#deck column:(\d+)', first_cell)
-                m_tags = re.match(r'^#tags column:(\d+)', first_cell)
-                if m_guid:
-                    col_idx["guid"] = int(m_guid.group(1)) - 1
-                    has_explicit_headers = True
-                elif m_type:
-                    col_idx["notetype"] = int(m_type.group(1)) - 1
-                    has_explicit_headers = True
-                elif m_deck:
-                    col_idx["deck"] = int(m_deck.group(1)) - 1
-                    has_explicit_headers = True
-                elif m_tags:
-                    col_idx["tags"] = int(m_tags.group(1)) - 1
-                    has_explicit_headers = True
-                continue
+    with open(export_txt_path, "rb") as f_raw:
+        content_bytes = f_raw.read()
 
-            if has_explicit_headers:
-                meta_cols = {col_idx["guid"], col_idx["notetype"], col_idx["deck"]}
-                field_cols = [i for i in range(len(row)) if i not in meta_cols and i != col_idx.get("tags", -1)]
-                if len(field_cols) >= 2:
-                    col_idx["front"], col_idx["back"] = field_cols[0], field_cols[1]
+    # utf-8-sig -> utf-8 (errors="replace") -> cp932 の順で安全に復号
+    try:
+        content_str = content_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            content_str = content_bytes.decode("cp932")
+        except UnicodeDecodeError:
+            content_str = content_bytes.decode("utf-8", errors="replace")
 
-            if len(row) <= max(col_idx["front"], col_idx["back"]):
-                continue
+    import io
+    reader = csv.reader(io.StringIO(content_str), delimiter="\t")
+    for row in reader:
+        if not row:
+            continue
+        first_cell = row[0].strip()
+        if first_cell.startswith("#"):
+            m_guid = re.match(r'^#guid column:(\d+)', first_cell)
+            m_type = re.match(r'^#notetype column:(\d+)', first_cell)
+            m_deck = re.match(r'^#deck column:(\d+)', first_cell)
+            m_tags = re.match(r'^#tags column:(\d+)', first_cell)
+            if m_guid:
+                col_idx["guid"] = int(m_guid.group(1)) - 1
+                has_explicit_headers = True
+            elif m_type:
+                col_idx["notetype"] = int(m_type.group(1)) - 1
+                has_explicit_headers = True
+            elif m_deck:
+                col_idx["deck"] = int(m_deck.group(1)) - 1
+                has_explicit_headers = True
+            elif m_tags:
+                col_idx["tags"] = int(m_tags.group(1)) - 1
+                has_explicit_headers = True
+            continue
 
-            guid = row[col_idx["guid"]].strip()
-            deck_val = row[col_idx["deck"]].strip() if col_idx["deck"] < len(row) else ""
-            front_html = row[col_idx["front"]].strip()
-            back_html = row[col_idx["back"]].strip()
-            tags_str = row[col_idx["tags"]].strip() if col_idx["tags"] < len(row) else ""
+        if has_explicit_headers:
+            meta_cols = {col_idx["guid"], col_idx["notetype"], col_idx["deck"]}
+            field_cols = [i for i in range(len(row)) if i not in meta_cols and i != col_idx.get("tags", -1)]
+            if len(field_cols) >= 2:
+                col_idx["front"], col_idx["back"] = field_cols[0], field_cols[1]
 
-            if deck_val and not guid_map_data["deck_name"]:
-                guid_map_data["deck_name"] = deck_val
+        if len(row) <= max(col_idx["front"], col_idx["back"]):
+            continue
 
-            all_imgs = re.findall(r'<img\s+[^>]*src=["\']([^"\']+)["\']', front_html + " " + back_html, flags=re.IGNORECASE)
-            for img_fn in set(all_imgs):
-                src_p = os.path.join(collection_media_dir, img_fn)
-                dst_p = os.path.join(dest_dir, img_fn)
-                if os.path.exists(src_p):
-                    shutil.copy2(src_p, dst_p)
-                    copied_count += 1
-                elif not os.path.exists(dst_p):
-                    missing_images.append(img_fn)
+        guid = row[col_idx["guid"]].strip()
+        deck_val = row[col_idx["deck"]].strip() if col_idx["deck"] < len(row) else ""
+        front_html = row[col_idx["front"]].strip()
+        back_html = row[col_idx["back"]].strip()
+        tags_str = row[col_idx["tags"]].strip() if col_idx["tags"] < len(row) else ""
 
-            f_match = re.search(r'<img\s+[^>]*src=["\']([^"\']+a\.(?:jpg|jpeg|png))["\']', front_html, flags=re.IGNORECASE)
-            b_match = re.search(r'<img\s+[^>]*src=["\']([^"\']+b\.(?:jpg|jpeg|png))["\']', back_html, flags=re.IGNORECASE)
-            if not b_match and f_match:
-                b_img = re.sub(r'a\.(jpg|jpeg|png)$', r'b.\1', f_match.group(1), flags=re.IGNORECASE)
-            elif b_match:
-                b_img = b_match.group(1)
-            else:
-                continue
+        if deck_val and not guid_map_data["deck_name"]:
+            guid_map_data["deck_name"] = deck_val
 
-            f_img = f_match.group(1) if f_match else re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_img, flags=re.IGNORECASE)
+        all_imgs = re.findall(r'<img\s+[^>]*src=["\']([^"\']+)["\']', front_html + " " + back_html, flags=re.IGNORECASE)
+        for img_fn in set(all_imgs):
+            src_p = os.path.join(collection_media_dir, img_fn)
+            dst_p = os.path.join(dest_dir, img_fn)
+            if os.path.exists(src_p):
+                shutil.copy2(src_p, dst_p)
+                copied_count += 1
+            elif not os.path.exists(dst_p):
+                missing_images.append(img_fn)
 
-            guid_map_data["notes"][b_img] = {
-                "guid": guid,
-                "f_img": f_img,
-                "b_img": b_img,
-                "front_html": front_html,
-                "tags": tags_str.split() if tags_str else []
-            }
-            restored_notes_count += 1
+        f_match = re.search(r'<img\s+[^>]*src=["\']([^"\']+a\.(?:jpg|jpeg|png))["\']', front_html, flags=re.IGNORECASE)
+        b_match = re.search(r'<img\s+[^>]*src=["\']([^"\']+b\.(?:jpg|jpeg|png))["\']', back_html, flags=re.IGNORECASE)
+        if not b_match and f_match:
+            b_img = re.sub(r'a\.(jpg|jpeg|png)$', r'b.\1', f_match.group(1), flags=re.IGNORECASE)
+        elif b_match:
+            b_img = b_match.group(1)
+        else:
+            continue
 
-            clean_ai = clean_extracted_back_html(back_html, b_img)
-            if clean_ai:
-                ai_cache[b_img] = clean_ai
-                restored_ai_count += 1
-            else:
-                ai_cache.pop(b_img, None)
+        f_img = f_match.group(1) if f_match else re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_img, flags=re.IGNORECASE)
+
+        guid_map_data["notes"][b_img] = {
+            "guid": guid,
+            "f_img": f_img,
+            "b_img": b_img,
+            "front_html": front_html,
+            "tags": tags_str.split() if tags_str else []
+        }
+        restored_notes_count += 1
+
+        clean_ai = clean_extracted_back_html(back_html, b_img)
+        if clean_ai:
+            ai_cache[b_img] = clean_ai
+            restored_ai_count += 1
+        else:
+            ai_cache.pop(b_img, None)
 
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(ai_cache, f, ensure_ascii=False, indent=2)
