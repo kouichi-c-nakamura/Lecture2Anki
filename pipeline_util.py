@@ -151,6 +151,8 @@ def clean_extracted_back_html(back_html, b_img):
 
     return s
 
+import io
+
 def restore_from_anki_export(
     export_txt_path,
     collection_media_dir=None,
@@ -184,10 +186,9 @@ def restore_from_anki_export(
     restored_notes_count = 0
     restored_ai_count = 0
 
+    # 確実にデコード（utf-8-sig -> cp932 -> replaceフォールバック）
     with open(export_txt_path, "rb") as f_raw:
         content_bytes = f_raw.read()
-
-    # utf-8-sig -> utf-8 (errors="replace") -> cp932 の順で安全に復号
     try:
         content_str = content_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -196,7 +197,6 @@ def restore_from_anki_export(
         except UnicodeDecodeError:
             content_str = content_bytes.decode("utf-8", errors="replace")
 
-    import io
     reader = csv.reader(io.StringIO(content_str), delimiter="\t")
     for row in reader:
         if not row:
