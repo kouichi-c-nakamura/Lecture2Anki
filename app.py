@@ -163,8 +163,17 @@ def save_folder_config(folder_path, config_data):
     save_last_folder(folder_path)
     return True
 
-def apply_folder_to_state(folder_path):
-    st.session_state.base_folder_val = folder_path
+def safe_set_state(key, value):
+    """ウィジェット描画前なら直接セットし、描画後なら次回復帰用の保留辞書に退避する"""
+    try:
+        st.session_state[key] = value
+    except Exception:
+        if "_pending_state_updates" not in st.session_state:
+            st.session_state["_pending_state_updates"] = {}
+        st.session_state["_pending_state_updates"][key] = value
+
+def apply_folder_to_state(folder_path, explicit_masked=None, explicit_unmasked=None):
+    safe_set_state("base_folder_val", folder_path)
     cfg = load_folder_config(folder_path)
     u_default, m_default = auto_detect_pdfs(folder_path)
 
@@ -172,19 +181,24 @@ def apply_folder_to_state(folder_path):
     g_title = cfg.get("group_title", "")
     p_deck = cfg.get("parent_deck", "")
 
-    # 親Deckとグループタイトルの分割・推論
     if "::" in d_name and not p_deck:
         parts = d_name.split("::", 1)
         p_deck = parts[0].strip()
         if not g_title:
             g_title = parts[1].strip()
 
-    st.session_state.parent_deck_val = p_deck
-    st.session_state.group_title_val = g_title
-    st.session_state.deck_name_val = f"{p_deck}::{g_title}" if (p_deck and g_title) else (d_name or g_title)
-    st.session_state.pdf_pass_val = cfg.get("password", "")
-    st.session_state.masked_pdf_val = cfg.get("masked_pdf") or m_default
-    st.session_state.unmasked_pdf_val = cfg.get("unmasked_pdf") or u_default
+    # Explicitly chosen files ALWAYS take precedence over directory defaults
+    final_masked = explicit_masked if explicit_masked else (cfg.get("masked_pdf") or m_default)
+    final_unmasked = explicit_unmasked if explicit_unmasked else (cfg.get("unmasked_pdf") or u_default)
+
+    safe_set_state("parent_deck_val", p_deck)
+    safe_set_state("parent_deck_input", p_deck)
+    safe_set_state("group_title_val", g_title)
+    safe_set_state("group_title_input", g_title)
+    safe_set_state("deck_name_val", f"{p_deck}::{g_title}" if (p_deck and g_title) else (d_name or g_title))
+    safe_set_state("pdf_pass_val", cfg.get("password", ""))
+    safe_set_state("masked_pdf_val", final_masked)
+    safe_set_state("unmasked_pdf_val", final_unmasked)
     save_last_folder(folder_path)
 
 
@@ -592,23 +606,24 @@ with tab_extract:
             if st.button("📄 選択...", key="btn_choose_masked", width="stretch"):
                 chosen_m = choose_file_dialog("マスク済みPDF (Masked) を選択", default_dir=st.session_state.get("base_folder_val"))
                 if chosen_m:
-                    st.session_state.masked_pdf_val = chosen_m
                     inferred_u = infer_unmasked_from_masked(chosen_m)
-                    if inferred_u:
-                        st.session_state.unmasked_pdf_val = inferred_u
                     parent_dir = os.path.dirname(chosen_m)
                     if parent_dir and os.path.isdir(parent_dir):
-                        apply_folder_to_state(parent_dir)
+                        apply_folder_to_state(parent_dir, explicit_masked=chosen_m, explicit_unmasked=inferred_u)
+                    else:
+                        safe_set_state("masked_pdf_val", chosen_m)
+                        if inferred_u:
+                            safe_set_state("unmasked_pdf_val", inferred_u)
                     st.rerun()
+
         with col_m1:
-            st.session_state.masked_input_widget = st.session_state.masked_pdf_val
             masked_pdf = st.text_input(
                 "マスク済みPDF (Masked) パス",
-                key="masked_input_widget",
+                value=st.session_state.get("masked_pdf_val", ""),
+                key="masked_pdf_val",
                 on_change=on_masked_input_change,
                 label_visibility="collapsed"
             )
-            st.session_state.masked_pdf_val = masked_pdf
 
         masked_fn = os.path.basename(masked_pdf.strip()) if masked_pdf else ""
         if not masked_pdf or not masked_pdf.strip():
@@ -1098,6 +1113,7 @@ with tab_ai_inspect:
                 label_visibility="collapsed",
             )
 
+            # --- プロンプト保存・コピー操作バー ---
             sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1.2])
             with sv_col1:
                 prompt_name = st.text_input("プロンプト保存名", placeholder="名前をつけて保存...", label_visibility="collapsed")
@@ -1109,6 +1125,7 @@ with tab_ai_inspect:
                         st.success(f"'{prompt_name}' を保存しました")
                         st.rerun()
             with sv_col3:
+                # JavaScriptを実行するため components.v1.html に戻す（サニタイズによる文字漏れを防止）
                 prompt_js = json.dumps(custom_prompt)
                 copy_btn_html = f"""
                 <button onclick='navigator.clipboard.writeText({prompt_js}); alert("プロンプトをクリップボードにコピーしました！");' 
@@ -1116,7 +1133,7 @@ with tab_ai_inspect:
                     📋 Promptコピー
                 </button>
                 """
-                st.html(copy_btn_html)
+                st.components.v1.html(copy_btn_html, height=42)
 
             model_labels = list(PRICING_MODELS.keys())
             default_inspect_idx = next((i for i, label in enumerate(model_labels) if "3.6 Flash" in label), 0)
