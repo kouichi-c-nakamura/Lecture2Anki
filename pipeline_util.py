@@ -20,6 +20,24 @@ MAX_IMAGE_LENGTH = 1600
 CANONICAL_MODEL_ID = 851727058
 CANONICAL_MODEL_NAME = "Medical AI Slide Model"
 
+# ==============================================================================
+# genanki モンキーパッチ: カードの休止（queue = -1）対応
+# ==============================================================================
+_orig_deck_write_to_db = genanki.Deck.write_to_db
+
+def _patched_deck_write_to_db(self, cursor, timestamp):
+    # 通常通り genanki に一時DBへ書き込ませる
+    _orig_deck_write_to_db(self, cursor, timestamp)
+    # 休止フラグが立っているノートのカードだけ、正規の休止ステータス (-1) に書き換える
+    for note in self.notes:
+        if getattr(note, "is_suspended", False):
+            cursor.execute(
+                "UPDATE cards SET queue = -1 WHERE nid = (SELECT id FROM notes WHERE guid = ?)",
+                (note.guid,)
+            )
+
+genanki.Deck.write_to_db = _patched_deck_write_to_db
+
 def get_poppler_path():
     """環境に合わせて Poppler の実行バイナリパスを自動解決する"""
     if shutil.which("pdftoppm"):
@@ -444,10 +462,16 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
                 ai_html = f'<div class="ai-container">{ai_body}</div>' if ai_body else ""
                 back_html = f'<img src="{b_img}">{ai_html}'
 
+            # pipeline_util.py の build_apkg 内（ノート作成ループ）
             guid = meta.get("guid") or genanki.guid_for(f"{effective_deck_name}_{data['page']}")
             tags = meta.get("tags", [])
+            
             note = genanki.Note(model=model, fields=[front_html, back_html], guid=guid, tags=tags)
             note.mod = current_timestamp
+            
+            # 休止フラグを渡す（タグは一切増やさない）
+            note.is_suspended = meta.get("is_suspended", False)
+            
             deck.add_note(note)
 
             media_list.extend([data['a'], data['b']])
