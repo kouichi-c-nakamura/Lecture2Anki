@@ -413,6 +413,12 @@ def confirm_batch_execution_dialog(
 st.set_page_config(page_title="PDF to Anki + AI Enhancer", layout="wide")
 st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 
+# 保留された状態更新（PDF選択時など）があれば、ウィジェット描画前に最優先で一括上書き
+if "_pending_state_updates" in st.session_state:
+    pending = st.session_state.pop("_pending_state_updates")
+    for k, v in pending.items():
+        st.session_state[k] = v
+
 if "base_folder_val" not in st.session_state:
     init_bf = get_last_folder()
     if init_bf:
@@ -480,6 +486,7 @@ with st.sidebar:
     with col_bf1:
         base_folder = st.text_input(
             "講義フォルダ",
+            value=st.session_state.get("base_folder_val", ""),
             key="base_folder_val",
             on_change=on_base_folder_input_change,
             placeholder="/path/to/lecture_folder",
@@ -608,7 +615,9 @@ with tab_extract:
                 if chosen_m:
                     inferred_u = infer_unmasked_from_masked(chosen_m)
                     parent_dir = os.path.dirname(chosen_m)
+                    
                     if parent_dir and os.path.isdir(parent_dir):
+                        # 保留更新キューを通じて親フォルダと選択ファイルパスを確実に次回実行へ渡す
                         apply_folder_to_state(parent_dir, explicit_masked=chosen_m, explicit_unmasked=inferred_u)
                     else:
                         safe_set_state("masked_pdf_val", chosen_m)
