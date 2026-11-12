@@ -1240,13 +1240,14 @@ with tab_ai_inspect:
 
                     for b_fn in target_b_names:
                         if b_fn not in notes_dict:
-                            # 2026-xx_001b.jpg -> 2026-xx_001a.jpg
                             inferred_f = re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_fn, flags=re.IGNORECASE)
                             notes_dict[b_fn] = {"b_img": b_fn, "f_img": inferred_f}
+                        # ★確実に休止フラグを True にセット
+                        notes_dict[b_fn]["is_suspended"] = True
 
                     gm_curr["notes"] = notes_dict
                     save_guid_map(gm_curr)
-                    st.toast(f"⏸️ 選択した {len(target_b_names)} 枚を休止に設定しました")
+                    st.toast(f"⏸️ 選択した {len(target_b_names)} 枚を一括休止に設定しました")
                     st.rerun()
 
             with col_sus2:
@@ -1261,8 +1262,11 @@ with tab_ai_inspect:
                     target_b_names = {os.path.basename(p) for p in selected_paths}
 
                     for b_fn in target_b_names:
-                        if b_fn in notes_dict:
-                            notes_dict[b_fn]["is_suspended"] = False
+                        if b_fn not in notes_dict:
+                            inferred_f = re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_fn, flags=re.IGNORECASE)
+                            notes_dict[b_fn] = {"b_img": b_fn, "f_img": inferred_f}
+                        # ★確実に休止フラグを False にセット
+                        notes_dict[b_fn]["is_suspended"] = False
 
                     gm_curr["notes"] = notes_dict
                     save_guid_map(gm_curr)
