@@ -1486,6 +1486,22 @@ with tab_build:
     target_dir = bf if (bf and os.path.exists(bf)) else "."
     display_dir = os.path.abspath(target_dir)
     st.info(f"📁 出力先フォルダ: `{display_dir}`")
+
+    # 現在の対象画像群における「休止（is_suspended=True）」の枚数を集計
+    current_b_names = {os.path.basename(f) for f in b_images}
+    gm_latest = get_guid_map().get("notes", {})
+    suspended_count = sum(
+        1 for b_fn in current_b_names
+        if gm_latest.get(b_fn, {}).get("is_suspended", False)
+    )
+
+    if suspended_count > 0:
+        st.warning(
+            f"⚠️ **休止設定のスライドが {suspended_count} 枚含まれています（`queue = -1`）**\n\n"
+            f"Ankiで `.apkg` を読み込む際、インポート画面の **「学習進捗も読み込む（Import any learning progress）」** の設定に注意してください：\n"
+            f"- **【新規デッキの初回インポート時】**: **ON（青色）** にして読み込んでください。これにより休止設定がそのまま反映されます。\n"
+            f"- **【すでに学習中の既存デッキへの再インポート時】**: 学習履歴を守るため **OFF（灰色）** のまま読み込んでください（※ONにすると既存の復習期日がリセットされます）。"
+        )
     
     col_out1, col_out2 = st.columns([1, 1])
     with col_out1:
@@ -1500,7 +1516,14 @@ with tab_build:
                 )
                 st.success(f"完成: {count} 枚のカードを含む '{os.path.basename(apkg_path)}' を保存しました！")
                 st.caption(f"保存場所: `{apkg_path}`")
-                st.info("※決定論的GUIDと正統Model IDにより、Ankiに再インポートしても学習進捗を維持したまま上書きされます。")
+                
+                if suspended_count > 0:
+                    st.error(
+                        f"🚨 **重要（休止カード {suspended_count} 枚を含む）**: "
+                        f"初回取り込み時は Anki の **「学習進捗も読み込む」を ON（青）** に設定してください。"
+                    )
+                else:
+                    st.info("※決定論的GUIDと正統Model IDにより、Ankiに再インポートしても学習進捗を維持したまま上書きされます。")
 
     with col_out2:
         if st.button("🗑️ 中間JPEG画像フォルダを全削除 (クリーンアップ)"):
