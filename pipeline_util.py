@@ -25,9 +25,9 @@ CANONICAL_MODEL_NAME = "Medical AI Slide Model"
 # ==============================================================================
 _orig_deck_write_to_db = genanki.Deck.write_to_db
 
-def _patched_deck_write_to_db(self, cursor, timestamp):
+def _patched_deck_write_to_db(self, cursor, *args, **kwargs):
     # 通常通り genanki に一時DBへ書き込ませる
-    _orig_deck_write_to_db(self, cursor, timestamp)
+    _orig_deck_write_to_db(self, cursor, *args, **kwargs)
     # 休止フラグが立っているノートのカードだけ、正規の休止ステータス (-1) に書き換える
     for note in self.notes:
         if getattr(note, "is_suspended", False):
@@ -402,12 +402,8 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
     effective_deck_name = deck_name.strip() or guid_map_data.get("deck_name", "Default_Deck")
 
     # 対象画像の抽出（guid_mapがある場合はその対象ノートの画像、無ければ最新タイムスタンプ）
-    if notes_meta:
-        target_fns = {m["f_img"] for m in notes_meta.values()} | {m["b_img"] for m in notes_meta.values()}
-        files = [f for f in files if os.path.basename(f) in target_fns]
-    else:
-        latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
-        files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
+    latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
+    files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
     
     pairs = {}
     pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{6})_(\d{3})([ab])\.jpg')
@@ -436,6 +432,7 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
             b_img = os.path.basename(data['b'])
             meta = notes_meta.get(b_img, {})
 
+            # meta に front_html や f_img が無くてもペアから安全に生成
             if meta.get("front_html"):
                 front_html = meta["front_html"]
             else:

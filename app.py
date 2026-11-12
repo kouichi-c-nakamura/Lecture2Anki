@@ -164,7 +164,7 @@ def save_folder_config(folder_path, config_data):
     return True
 
 def safe_set_state(key, value):
-    """ウィジェット描画前なら直接セットし、描画後なら次回復帰用の保留辞書に退避する"""
+    """ウィジェット描画前なら直接セットし、描画後なら保留キューに退避する"""
     try:
         st.session_state[key] = value
     except Exception:
@@ -566,17 +566,14 @@ if "custom_prompt_val" not in st.session_state:
 if "selected_batch_slides" not in st.session_state:
     st.session_state.selected_batch_slides = set()
 
-# 画像探索（guid_map の notes キーおよび b_img フィールドの両方と整合）
+# 画像探索: 常に最新バッチの画像、または抽出された全画像をそのまま表示
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
 guid_map_data = get_guid_map()
 notes_meta = guid_map_data.get("notes", {})
 b_images = []
 
-if notes_meta:
-    target_b_names = set(notes_meta.keys()) | {v.get("b_img") for v in notes_meta.values() if isinstance(v, dict)}
-    b_images = [f for f in all_b_images if os.path.basename(f) in target_b_names]
-
-if not b_images and all_b_images:
+if all_b_images:
+    # 最新タイムスタンプのプレフィックス（例: 2026-11-11_152954）を持つ画像群をすべて取得
     latest_ts = sorted({os.path.basename(f)[:17] for f in all_b_images})[-1]
     b_images = [f for f in all_b_images if os.path.basename(f).startswith(latest_ts)]
 
@@ -853,7 +850,7 @@ with tab_ai_batch:
 
 
 # ==============================================================================
-# タブ 3: 個別スライド確認 & 複数選択バッチ並列生成（休止操作・表示対応）
+# タブ 3: 個別スライド確認 & 複数選択バッチ並列生成
 # ==============================================================================
 with tab_ai_inspect:
     st.subheader("個別スライドの確認・プロンプト再生成 & 複数選択バッチ生成")
@@ -1001,6 +998,7 @@ with tab_ai_inspect:
         """
         st.html(active_scroll_html)
 
+        # 3. ナビゲーションバー（スライド移動 ＋ [ ] ⏸️ 休止 ＋ [ ] 🎯 対象）
         target_img = b_images[st.session_state.slide_idx]
         fn = os.path.basename(target_img)
         is_cur_in_batch = (fn in st.session_state.selected_batch_slides)
@@ -1028,11 +1026,13 @@ with tab_ai_inspect:
         def on_nav_suspend_toggle(slide_filename, widget_key):
             def _cb():
                 val = st.session_state.get(widget_key, False)
-                if slide_filename not in notes_meta:
-                    notes_meta[slide_filename] = {}
-                notes_meta[slide_filename]["is_suspended"] = val
-                guid_map_data["notes"] = notes_meta
-                save_guid_map(guid_map_data)
+                gm_curr = get_guid_map()
+                notes_dict = gm_curr.get("notes", {})
+                if slide_filename not in notes_dict:
+                    notes_dict[slide_filename] = {"b_img": slide_filename}
+                notes_dict[slide_filename]["is_suspended"] = val
+                gm_curr["notes"] = notes_dict
+                save_guid_map(gm_curr)
             return _cb
 
         nav_1, nav_2, nav_chk_col1, nav_chk_col2, nav_3 = st.columns([1.1, 2.3, 0.85, 0.85, 1.1])
@@ -1223,6 +1223,51 @@ with tab_ai_inspect:
                     est_cost_usd=batch_cost_usd,
                     api_key=api_key,
                 )
+            
+            # --- 選択したスライドの一括休止 / 休止解除操作エリア ---
+            st.markdown("<div style='height: 6px;'></div>", unsafe_allow_html=True)
+            col_sus1, col_sus2 = st.columns(2)
+            with col_sus1:
+                if st.button(
+                    f"⏸️ 選択した {sel_count} 枚を一括休止",
+                    disabled=(sel_count == 0),
+                    width="stretch",
+                    help="選択中のスライドをすべて Anki 休止カード (queue = -1) に設定します"
+                ):
+                    gm_curr = get_guid_map()
+                    notes_dict = gm_curr.get("notes", {})
+                    target_b_names = {os.path.basename(p) for p in selected_paths}
+
+                    for b_fn in target_b_names:
+                        if b_fn not in notes_dict:
+                            # 2026-xx_001b.jpg -> 2026-xx_001a.jpg
+                            inferred_f = re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_fn, flags=re.IGNORECASE)
+                            notes_dict[b_fn] = {"b_img": b_fn, "f_img": inferred_f}
+
+                    gm_curr["notes"] = notes_dict
+                    save_guid_map(gm_curr)
+                    st.toast(f"⏸️ 選択した {len(target_b_names)} 枚を休止に設定しました")
+                    st.rerun()
+
+            with col_sus2:
+                if st.button(
+                    f"▶️ 選択した {sel_count} 枚の休止を解除",
+                    disabled=(sel_count == 0),
+                    width="stretch",
+                    help="選択中のスライドの休止設定をすべて解除（有効化）します"
+                ):
+                    gm_curr = get_guid_map()
+                    notes_dict = gm_curr.get("notes", {})
+                    target_b_names = {os.path.basename(p) for p in selected_paths}
+
+                    for b_fn in target_b_names:
+                        if b_fn in notes_dict:
+                            notes_dict[b_fn]["is_suspended"] = False
+
+                    gm_curr["notes"] = notes_dict
+                    save_guid_map(gm_curr)
+                    st.toast(f"▶️ 選択した {len(target_b_names)} 枚の休止を解除しました")
+                    st.rerun()
 
         # ----------------------------------------------------------------------
         # プレビュー表示エリア (components.v1.html による完全隔離レンダリング)
