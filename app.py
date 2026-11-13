@@ -42,6 +42,7 @@ FOLDER_CONFIG_FILENAME = "lecture_config.json"
 CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
+API_USAGE_LOG_FILE = os.path.join(DEST_DIR, "api_usage_log.jsonl")
 
 PRICING_MODELS = {
     "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
@@ -202,7 +203,7 @@ def apply_folder_to_state(folder_path, explicit_masked=None, explicit_unmasked=N
 
 
 # ==============================================================================
-# AI解説キャッシュ管理 & GUID Map（休止状態永続化）
+# AI解説キャッシュ管理 & GUID Map & API利用実績集計
 # ==============================================================================
 def get_ai_cache():
     return json.load(open(CACHE_FILE, "r", encoding="utf-8")) if os.path.exists(CACHE_FILE) else {}
@@ -224,6 +225,54 @@ def save_guid_map(data):
     os.makedirs(DEST_DIR, exist_ok=True)
     p = os.path.join(DEST_DIR, "guid_map.json")
     json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+def load_api_usage_stats():
+    """過去のapi_usage_log.jsonlから累計実績と平均トークン数を算出する"""
+    records = []
+    if os.path.exists(API_USAGE_LOG_FILE):
+        try:
+            with open(API_USAGE_LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except Exception:
+            pass
+
+    if not records:
+        return {
+            "count": 0,
+            "total_jpy": 0.0,
+            "total_tokens": 0,
+            "avg_in_std": 2800,
+            "avg_out_std": 3500,
+            "avg_in_svg": 3800,
+            "avg_out_svg": 5500,
+            "recent": [],
+        }
+
+    total_jpy = sum(r.get("cost_jpy", 0.0) for r in records)
+    total_tokens = sum(r.get("total_tokens", 0) for r in records)
+
+    std_recs = [r for r in records if not r.get("is_svg")]
+    svg_recs = [r for r in records if r.get("is_svg")]
+
+    avg_in_std = int(sum(r["prompt_tokens"] for r in std_recs[-20:]) / len(std_recs[-20:])) if std_recs else 2800
+    avg_out_std = int(sum((r["output_tokens"] + r["thought_tokens"]) for r in std_recs[-20:]) / len(std_recs[-20:])) if std_recs else 3500
+
+    avg_in_svg = int(sum(r["prompt_tokens"] for r in svg_recs[-20:]) / len(svg_recs[-20:])) if svg_recs else 3800
+    avg_out_svg = int(sum((r["output_tokens"] + r["thought_tokens"]) for r in svg_recs[-20:]) / len(svg_recs[-20:])) if svg_recs else 5500
+
+    return {
+        "count": len(records),
+        "total_jpy": total_jpy,
+        "total_tokens": total_tokens,
+        "avg_in_std": avg_in_std,
+        "avg_out_std": avg_out_std,
+        "avg_in_svg": avg_in_svg,
+        "avg_out_svg": avg_out_svg,
+        "recent": records[-10:][::-1],
+    }
 
 
 # ==============================================================================
@@ -372,7 +421,7 @@ def confirm_batch_execution_dialog(
     st.markdown(
         f"- **実行方式:** Gemini API 並列実行 (**{max_workers} 並列**)\n"
         f"- **使用モデル:** `{model_label}` (`{model_id}`)\n"
-        f"- **推定コスト:** **約 {est_cost_jpy:.2f} 円** (`${est_cost_usd:.4f}`)"
+        f"- **推定コスト（実績基準）:** **約 {est_cost_jpy:.2f} 円** (`${est_cost_usd:.4f}`)"
     )
 
     col_ok, col_cancel = st.columns([1.5, 1])
@@ -390,9 +439,12 @@ def confirm_batch_execution_dialog(
         status_box = st.empty()
         errors = []
         completed = 0
+        total_actual_jpy = 0.0
+        total_actual_tokens = 0
 
         def _worker(img_p):
-            return os.path.basename(img_p), call_gemini_enhance(img_p, api_key, model_id, prompt_text)
+            html_out, u_rec = call_gemini_enhance(img_p, api_key, model_id, prompt_text, return_usage=True)
+            return os.path.basename(img_p), html_out, u_rec
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_path = {executor.submit(_worker, p): p for p in selected_paths}
@@ -400,9 +452,11 @@ def confirm_batch_execution_dialog(
                 p_orig = future_to_path[future]
                 f_name = os.path.basename(p_orig)
                 try:
-                    res_fn, html_res = future.result()
+                    res_fn, html_res, u_rec = future.result()
                     ai_cache_local[res_fn] = html_res
                     save_ai_cache(ai_cache_local)
+                    total_actual_jpy += u_rec["cost_jpy"]
+                    total_actual_tokens += u_rec["total_tokens"]
                     st.session_state.pop(f"edit_html_{res_fn}", None)
                     st.session_state.selected_batch_slides.discard(res_fn)
                     st.session_state[f"chk_batch_{res_fn}"] = False
@@ -410,13 +464,13 @@ def confirm_batch_execution_dialog(
                     errors.append(f"{f_name}: {exc}")
                 completed += 1
                 pbar.progress(completed / sel_count)
-                status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新完了 {f_name}")
+                status_box.text(f"並列生成中 ({completed}/{sel_count} 完了): 最新 {f_name} ｜ 累計実測 約 {total_actual_jpy:.2f} 円")
 
         if errors:
             st.error("一部のスライドでエラーが発生しました:\n" + "\n".join(errors))
         else:
-            status_box.success(f"🎉 {sel_count} 枚のAI解説生成が完了しました！")
-            st.toast(f"✅ {sel_count} 枚のバッチ生成が完了しました！")
+            status_box.success(f"🎉 {sel_count} 枚完了！ 実測合計: 約 {total_actual_jpy:.2f} 円 ({total_actual_tokens:,} tok)")
+            st.toast(f"✅ {sel_count} 枚完了（実測: 約 {total_actual_jpy:.2f} 円）")
             st.rerun()
 
 
@@ -426,7 +480,6 @@ def confirm_batch_execution_dialog(
 st.set_page_config(page_title="PDF to Anki + AI Enhancer", layout="wide")
 st.title("医学部講義PDF ➔ Ankiカード & AI強化 生成システム")
 
-# 保留された状態更新があれば、ウィジェット描画前に最優先で一括上書き
 if "_pending_state_updates" in st.session_state:
     pending = st.session_state.pop("_pending_state_updates")
     for k, v in pending.items():
@@ -445,7 +498,6 @@ if "base_folder_val" not in st.session_state:
         st.session_state.unmasked_pdf_val = ""
         st.session_state.masked_pdf_val = ""
 
-# 親Deck名またはグループタイトル変更時の自動合成コールバック
 def on_deck_naming_change():
     p = st.session_state.get("parent_deck_input", "").strip()
     g = st.session_state.get("group_title_input", "").strip()
@@ -479,7 +531,7 @@ def on_unmasked_input_change():
 
 
 # ==============================================================================
-# サイドバー: 講義設定 & デッキ名自動合成
+# サイドバー: 講義設定 & デッキ名自動合成 & API実績モニター
 # ==============================================================================
 with st.sidebar:
     st.header("講義フォルダ・デッキ設定")
@@ -558,6 +610,26 @@ with st.sidebar:
     st.markdown("---")
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
 
+    # API実測コストサマリー表示
+    u_stats = load_api_usage_stats()
+    st.markdown("**📊 API実測コスト累計（ローカル記録）**")
+    st.caption(
+        f"実行回数: **{u_stats['count']} 回** ｜ "
+        f"総トークン: **{u_stats['total_tokens']:,}**\n\n"
+        f"概算累計請求額: **約 {u_stats['total_jpy']:.1f} 円**"
+    )
+    if u_stats["recent"]:
+        with st.expander("直近の実測トークン履歴 (最新10件)", expanded=False):
+            for r in u_stats["recent"]:
+                mode_tag = "🎯SVG" if r.get("is_svg") else "標準"
+                st.markdown(
+                    f"<div style='font-size:11px; border-bottom:1px solid #334155; padding:4px 0;'>"
+                    f"<b>{r['image']}</b> ({mode_tag})<br>"
+                    f"In:{r['prompt_tokens']:,} / Out:{r['output_tokens']:,} / Think:{r['thought_tokens']:,} ➔ <b>{r['cost_jpy']:.2f}円</b>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
 # セッション状態変数の初期化
 if "slide_idx" not in st.session_state:
     st.session_state.slide_idx = 0
@@ -566,14 +638,13 @@ if "custom_prompt_val" not in st.session_state:
 if "selected_batch_slides" not in st.session_state:
     st.session_state.selected_batch_slides = set()
 
-# 画像探索: 常に最新バッチの画像、または抽出された全画像をそのまま表示
+# 画像探索: 常に最新バッチの画像をすべて表示
 all_b_images = sorted(glob.glob(os.path.join(DEST_DIR, "*b.jpg")))
 guid_map_data = get_guid_map()
 notes_meta = guid_map_data.get("notes", {})
 b_images = []
 
 if all_b_images:
-    # 最新タイムスタンプのプレフィックス（例: 2026-11-11_152954）を持つ画像群をすべて取得
     latest_ts = sorted({os.path.basename(f)[:17] for f in all_b_images})[-1]
     b_images = [f for f in all_b_images if os.path.basename(f).startswith(latest_ts)]
 
@@ -592,7 +663,7 @@ tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
 
 
 # ==============================================================================
-# タブ 1: PDFファイルの指定とJPEG書き出し（動線を一本化）
+# タブ 1: PDFファイルの指定とJPEG書き出し
 # ==============================================================================
 with tab_extract:
     st.subheader("PDFファイルの指定とJPEG書き出し")
@@ -804,10 +875,13 @@ with tab_ai_batch:
     st.write(f"検出されたBack画像: **{len(b_images)} 枚**（うち未処理: **{len(unprocessed)} 枚**）")
 
     if unprocessed:
-        in_tokens = len(unprocessed) * 700
-        out_tokens = len(unprocessed) * 1200
+        u_stats = load_api_usage_stats()
+        est_in_per_slide = u_stats["avg_in_std"]
+        est_out_per_slide = u_stats["avg_out_std"]
+        in_tokens = len(unprocessed) * est_in_per_slide
+        out_tokens = len(unprocessed) * est_out_per_slide
 
-        st.markdown("#### モデル別 費用試算（未処理枚数分）")
+        st.markdown(f"#### モデル別 費用試算（未処理 {len(unprocessed)} 枚分｜実測基準: 入力 {est_in_per_slide:,} / 出力+思考 {est_out_per_slide:,} tok/枚）")
         calc_rows = []
         for name, spec in PRICING_MODELS.items():
             cost_usd = (in_tokens / 1_000_000 * spec["in"]) + (out_tokens / 1_000_000 * spec["out"])
@@ -815,7 +889,7 @@ with tab_ai_batch:
             calc_rows.append({
                 "モデル": name,
                 "全体費用 (JPY)": f"約 {cost_jpy:.2f} 円",
-                "1枚あたり": f"{(cost_jpy/len(unprocessed)):.3f} 円",
+                "1枚あたり": f"{(cost_jpy/len(unprocessed)):.2f} 円",
                 "USD換算": f"${cost_usd:.4f}"
             })
         st.table(calc_rows)
@@ -829,21 +903,25 @@ with tab_ai_batch:
         if st.button("🚀 承認して一括AI解説を生成", type="primary", disabled=not (is_approved and api_key)):
             pbar = st.progress(0)
             status_box = st.empty()
+            batch_actual_jpy = 0.0
+            batch_actual_tokens = 0
             
             for idx, img_path in enumerate(unprocessed):
                 fn = os.path.basename(img_path)
                 status_box.text(f"解説作成中 ({idx+1}/{len(unprocessed)}): {fn}")
                 try:
-                    html_text = call_gemini_enhance(img_path, api_key, model_id)
+                    html_text, u_rec = call_gemini_enhance(img_path, api_key, model_id, return_usage=True)
                     ai_cache[fn] = html_text
                     save_ai_cache(ai_cache)
+                    batch_actual_jpy += u_rec["cost_jpy"]
+                    batch_actual_tokens += u_rec["total_tokens"]
                     st.session_state.pop(f"edit_html_{fn}", None)
                 except Exception as e:
                     st.error(f"{fn} でAPIエラー発生: {e}")
                     break
                 pbar.progress((idx + 1) / len(unprocessed))
             
-            status_box.success("一括生成が完了しました！")
+            status_box.success(f"一括生成が完了しました！ 実測合計: 約 {batch_actual_jpy:.2f} 円 ({batch_actual_tokens:,} tok)")
             st.rerun()
     else:
         st.success("すべてのスライドのAI解説が完了済みです。")
@@ -917,7 +995,6 @@ with tab_ai_inspect:
                     st.session_state.selected_batch_slides.discard(slide_fn)
             return _cb
 
-        # サムネイル表示ループ（休止状態の破線・減光ビジュアル反映）
         cols_per_row = 4
         with st.container(height=420, border=True):
             for r_start in range(0, total_slides, cols_per_row):
@@ -937,12 +1014,10 @@ with tab_ai_inspect:
                         if chk_key not in st.session_state:
                             st.session_state[chk_key] = is_batch_checked
 
-                        # 休止フラグ判定
                         is_slide_suspended = notes_meta.get(p_fn, {}).get("is_suspended", False)
 
                         with cols[c_idx]:
                             if is_slide_suspended:
-                                # 休止カード: 薄暗いグレー破線枠＋半透明化
                                 img_border = "border: 2px dashed #94a3b8; opacity: 0.45; filter: grayscale(50%);"
                                 status_icon = "⏸️"
                             elif is_batch_checked:
@@ -971,7 +1046,6 @@ with tab_ai_inspect:
                                     st.session_state.slide_idx = idx
                                     st.rerun()
 
-        # 自動スクロール追従スクリプト
         active_scroll_html = f"""
         <div style="display:none;">
             <script>
@@ -1029,7 +1103,8 @@ with tab_ai_inspect:
                 gm_curr = get_guid_map()
                 notes_dict = gm_curr.get("notes", {})
                 if slide_filename not in notes_dict:
-                    notes_dict[slide_filename] = {"b_img": slide_filename}
+                    inferred_f = re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', slide_filename, flags=re.IGNORECASE)
+                    notes_dict[slide_filename] = {"b_img": slide_filename, "f_img": inferred_f}
                 notes_dict[slide_filename]["is_suspended"] = val
                 gm_curr["notes"] = notes_dict
                 save_guid_map(gm_curr)
@@ -1043,7 +1118,6 @@ with tab_ai_inspect:
         with nav_2:
             st.markdown(f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>スライド {st.session_state.slide_idx + 1} / {total_slides} : {fn}</div>", unsafe_allow_html=True)
         with nav_chk_col1:
-            # 左側に「休止」
             st.checkbox(
                 "⏸️ 休止",
                 value=is_cur_suspended,
@@ -1052,7 +1126,6 @@ with tab_ai_inspect:
                 help="Ankiインポート時に休止カード (queue = -1) に設定"
             )
         with nav_chk_col2:
-            # 右側（次のスライドの直前）に頻用する「対象」
             st.checkbox(
                 "🎯 対象",
                 value=is_cur_in_batch,
@@ -1067,7 +1140,7 @@ with tab_ai_inspect:
 
         st.markdown("---")
 
-        # 4. スライド画像表示エリア（重複ボタンを廃止し、クリップボードコピーのみに集約）
+        # 4. スライド画像表示エリア
         col_v1, col_v2 = st.columns([1, 1])
         with col_v1:
             st.image(target_img, caption=fn, width="stretch")
@@ -1172,24 +1245,33 @@ with tab_ai_inspect:
             
             chosen_spec = PRICING_MODELS[sel_inspect_label]
             sel_inspect_model = chosen_spec["id"]
+
+            # 実測平均ベースの単価試算
+            u_stats_now = load_api_usage_stats()
+            is_svg_now = "svg-overlay-wrap" in custom_prompt
+            est_in = u_stats_now["avg_in_svg"] if is_svg_now else u_stats_now["avg_in_std"]
+            est_out = u_stats_now["avg_out_svg"] if is_svg_now else u_stats_now["avg_out_std"]
             
-            single_in_cost = (700 / 1_000_000) * chosen_spec["in"]
-            single_out_cost = (1200 / 1_000_000) * chosen_spec["out"]
+            single_in_cost = (est_in / 1_000_000) * chosen_spec["in"]
+            single_out_cost = (est_out / 1_000_000) * chosen_spec["out"]
             single_cost_usd = single_in_cost + single_out_cost
             single_cost_jpy = single_cost_usd * USD_JPY
 
             with gen_c2:
-                st.caption(f"💰 1枚推定: **約 {single_cost_jpy:.3f} 円** (`${single_cost_usd:.4f}`)")
+                st.caption(f"💰 1枚推定: **約 {single_cost_jpy:.2f} 円** (`${single_cost_usd:.4f}`)")
 
             if st.button("✨ 表示中の1枚のみAPI生成 (Gemini)", disabled=not api_key, width="stretch"):
                 keep_recent_prompt(custom_prompt)
                 with st.spinner(f"{fn} のAI解説を生成中..."):
                     try:
-                        new_html = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt)
+                        new_html, u_rec = call_gemini_enhance(target_img, api_key, sel_inspect_model, custom_prompt, return_usage=True)
                         ai_cache[fn] = new_html
                         save_ai_cache(ai_cache)
                         st.session_state.pop(f"edit_html_{fn}", None)
-                        st.success("更新しました！")
+                        st.toast(
+                            f"✅ 生成完了: 約 {u_rec['cost_jpy']:.2f} 円 "
+                            f"(入力:{u_rec['prompt_tokens']:,} / 出力:{u_rec['output_tokens']:,} / 思考:{u_rec['thought_tokens']:,})"
+                        )
                         st.rerun()
                     except Exception as e:
                         st.error(f"API通信エラーが発生しました: {e}")
@@ -1242,7 +1324,6 @@ with tab_ai_inspect:
                         if b_fn not in notes_dict:
                             inferred_f = re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_fn, flags=re.IGNORECASE)
                             notes_dict[b_fn] = {"b_img": b_fn, "f_img": inferred_f}
-                        # ★確実に休止フラグを True にセット
                         notes_dict[b_fn]["is_suspended"] = True
 
                     gm_curr["notes"] = notes_dict
@@ -1265,7 +1346,6 @@ with tab_ai_inspect:
                         if b_fn not in notes_dict:
                             inferred_f = re.sub(r'b\.(jpg|jpeg|png)$', r'a.\1', b_fn, flags=re.IGNORECASE)
                             notes_dict[b_fn] = {"b_img": b_fn, "f_img": inferred_f}
-                        # ★確実に休止フラグを False にセット
                         notes_dict[b_fn]["is_suspended"] = False
 
                     gm_curr["notes"] = notes_dict
@@ -1279,7 +1359,6 @@ with tab_ai_inspect:
         st.markdown("---")
         st.markdown("#### プレビュー (Anki Back面)")
 
-        # 休止状態の視覚的強調バナー
         is_cur_suspended = notes_meta.get(fn, {}).get("is_suspended", False)
         if is_cur_suspended:
             st.markdown("""
@@ -1293,7 +1372,6 @@ with tab_ai_inspect:
             preview_html_body = ai_cache[fn]
             has_svg_overlay = ("<svg" in preview_html_body and "<img" in preview_html_body)
             
-            # SLIDE_IMAGE.jpg を実スライドBase64画像へ置換
             if has_svg_overlay and os.path.exists(target_img):
                 with open(target_img, "rb") as img_f:
                     full_b64 = base64.b64encode(img_f.read()).decode("utf-8")
@@ -1321,7 +1399,6 @@ with tab_ai_inspect:
                     box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.08);
                     color: #1e293b !important;
                 }}
-                /* SVGオーバーレイ位置ずれ完全抑制リセット */
                 .svg-overlay-wrap {{
                     position: relative !important;
                     display: block !important;
@@ -1487,7 +1564,6 @@ with tab_build:
     display_dir = os.path.abspath(target_dir)
     st.info(f"📁 出力先フォルダ: `{display_dir}`")
 
-    # 現在の対象画像群における「休止（is_suspended=True）」の枚数を集計
     current_b_names = {os.path.basename(f) for f in b_images}
     gm_latest = get_guid_map().get("notes", {})
     suspended_count = sum(

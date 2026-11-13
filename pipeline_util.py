@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import csv
 import json
 import glob
@@ -20,15 +21,24 @@ MAX_IMAGE_LENGTH = 1600
 CANONICAL_MODEL_ID = 851727058
 CANONICAL_MODEL_NAME = "Medical AI Slide Model"
 
+# API実測ログ・単価定義
+API_USAGE_LOG_FILE = os.path.join(DEST_DIR, "api_usage_log.jsonl")
+USD_JPY_RATE = 155.0
+
+MODEL_PRICING_PER_1M = {
+    "gemini-3.6-flash":      {"in": 0.75, "out": 3.75},
+    "gemini-3.5-flash-lite": {"in": 0.30, "out": 2.50},
+    "gemini-3.8-flash":      {"in": 0.75, "out": 3.75},
+    "gemini-4-argon":        {"in": 2.00, "out": 10.00},
+}
+
 # ==============================================================================
 # genanki モンキーパッチ: カードの休止（queue = -1）対応
 # ==============================================================================
 _orig_deck_write_to_db = genanki.Deck.write_to_db
 
 def _patched_deck_write_to_db(self, cursor, *args, **kwargs):
-    # 通常通り genanki に一時DBへ書き込ませる
     _orig_deck_write_to_db(self, cursor, *args, **kwargs)
-    # 休止フラグが立っているノートのカードだけ、正規の休止ステータス (-1) に書き換える
     for note in self.notes:
         if getattr(note, "is_suspended", False):
             cursor.execute(
@@ -37,6 +47,34 @@ def _patched_deck_write_to_db(self, cursor, *args, **kwargs):
             )
 
 genanki.Deck.write_to_db = _patched_deck_write_to_db
+
+def log_api_usage(img_filename, model_id, prompt_tokens, output_tokens, thought_tokens, is_svg=False):
+    """Gemini APIの実測トークン消費量（思考トークン含む）と概算コストをJSONL形式で記録する"""
+    os.makedirs(os.path.dirname(API_USAGE_LOG_FILE), exist_ok=True)
+    spec = MODEL_PRICING_PER_1M.get(model_id, {"in": 0.75, "out": 3.75})
+
+    total_out_billed = output_tokens + thought_tokens
+    cost_usd = (prompt_tokens / 1_000_000 * spec["in"]) + (total_out_billed / 1_000_000 * spec["out"])
+    cost_jpy = cost_usd * USD_JPY_RATE
+
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "image": img_filename,
+        "model_id": model_id,
+        "is_svg": is_svg,
+        "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "thought_tokens": thought_tokens,
+        "total_tokens": prompt_tokens + total_out_billed,
+        "cost_usd": round(cost_usd, 6),
+        "cost_jpy": round(cost_jpy, 4),
+    }
+    try:
+        with open(API_USAGE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return record
 
 def get_poppler_path():
     """環境に合わせて Poppler の実行バイナリパスを自動解決する"""
@@ -148,10 +186,6 @@ def get_canonical_model():
 # Ankiエクスポート (.txt / TSV) からの作業状態復元ロジック
 # ==============================================================================
 def clean_extracted_back_html(back_html, b_img):
-    """
-    AnkiのBack列HTMLから外側の <img> やラッパー <div> を剥がし、
-    キャッシュに格納すべき純粋な解説HTML（またはSVG+解説HTML）を抽出する。
-    """
     s = back_html.strip()
     s = re.sub(r'^\s*<img\s+[^>]*src=["\']' + re.escape(b_img) + r'["\'][^>]*>\s*', '', s, count=1, flags=re.IGNORECASE).strip()
     if not s:
@@ -168,8 +202,6 @@ def clean_extracted_back_html(back_html, b_img):
             s = inner
 
     return s
-
-import io
 
 def restore_from_anki_export(
     export_txt_path,
@@ -204,7 +236,6 @@ def restore_from_anki_export(
     restored_notes_count = 0
     restored_ai_count = 0
 
-    # 確実にデコード（utf-8-sig -> cp932 -> replaceフォールバック）
     with open(export_txt_path, "rb") as f_raw:
         content_bytes = f_raw.read()
     try:
@@ -357,12 +388,13 @@ def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password=""
 
     return timestamp, len(page_list)
 
-def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None):
+def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None, return_usage=False):
     client = genai.Client(api_key=api_key)
     img = Image.open(img_path)
     prompt = custom_prompt or DEFAULT_PROMPT
+    is_svg = "svg-overlay-wrap" in prompt
 
-    if "svg-overlay-wrap" in prompt:
+    if is_svg:
         w, h = img.size
         target_h = int(round(1000 * h / w))
         prompt = re.sub(
@@ -379,11 +411,23 @@ def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None):
             temperature=0.2
         )
     )
+
+    # 実測トークンメタデータの抽出とログ記録
+    usage = getattr(response, "usage_metadata", None)
+    p_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+    o_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+    t_tok = int(getattr(usage, "thoughts_token_count", 0) or 0)
+    usage_record = log_api_usage(os.path.basename(img_path), model_id, p_tok, o_tok, t_tok, is_svg=is_svg)
+
     text = response.text.strip()
     if text.startswith("```html"): text = text[7:]
     if text.startswith("```"): text = text[3:]
     if text.endswith("```"): text = text[:-3]
-    return text.strip()
+    clean_html = text.strip()
+
+    if return_usage:
+        return clean_html, usage_record
+    return clean_html
 
 def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None):
     files = sorted(glob.glob(os.path.join(dest_dir, "*.jpg")))
@@ -401,7 +445,6 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
     notes_meta = guid_map_data.get("notes", {})
     effective_deck_name = deck_name.strip() or guid_map_data.get("deck_name", "Default_Deck")
 
-    # 対象画像の抽出（guid_mapがある場合はその対象ノートの画像、無ければ最新タイムスタンプ）
     latest_ts = sorted({os.path.basename(f)[:17] for f in files})[-1]
     files = [f for f in files if os.path.basename(f).startswith(latest_ts)]
     
@@ -417,13 +460,10 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
                 pairs[key] = {"page": page_num}
             pairs[key][m.group(3)] = f
 
-    # 共通の標準モデルと決定論的デッキID
     model = get_canonical_model()
     deck_id = zlib.crc32(effective_deck_name.encode("utf-8"))
     deck = genanki.Deck(deck_id, effective_deck_name)
     media_list = []
-
-    # Ankiが「新しいノート」と認識するように現時刻タイムスタンプを明示
     current_timestamp = int(time.time())
 
     for key, data in sorted(pairs.items()):
@@ -432,7 +472,6 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
             b_img = os.path.basename(data['b'])
             meta = notes_meta.get(b_img, {})
 
-            # meta に front_html や f_img が無くてもペアから安全に生成
             if meta.get("front_html"):
                 front_html = meta["front_html"]
             else:
@@ -459,18 +498,14 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None)
                 ai_html = f'<div class="ai-container">{ai_body}</div>' if ai_body else ""
                 back_html = f'<img src="{b_img}">{ai_html}'
 
-            # pipeline_util.py の build_apkg 内（ノート作成ループ）
             guid = meta.get("guid") or genanki.guid_for(f"{effective_deck_name}_{data['page']}")
             tags = meta.get("tags", [])
             
             note = genanki.Note(model=model, fields=[front_html, back_html], guid=guid, tags=tags)
             note.mod = current_timestamp
-            
-            # 休止フラグを渡す（タグは一切増やさない）
             note.is_suspended = meta.get("is_suspended", False)
             
             deck.add_note(note)
-
             media_list.extend([data['a'], data['b']])
 
     filename = f"{effective_deck_name.replace('::', '_').replace('/', '_')}.apkg"
