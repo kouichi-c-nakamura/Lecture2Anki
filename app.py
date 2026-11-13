@@ -652,13 +652,12 @@ ai_cache = get_ai_cache()
 
 
 # ==============================================================================
-# メイン画面タブ構成
+# メイン画面タブ構成（3タブにシンプル化）
 # ==============================================================================
-tab_extract, tab_ai_batch, tab_ai_inspect, tab_build = st.tabs([
+tab_extract, tab_ai_inspect, tab_build = st.tabs([
     "1. PDF指定 & 抽出", 
-    "2. 💰 AI解説の一括追加", 
-    "3. 🔍 個別AI解説 & 選択バッチ生成", 
-    "4. 📦 Ankiパッケージ出力"
+    "2. 🔍 AI解説 & バッチ生成・休止管理", 
+    "3. 📦 Ankiパッケージ出力"
 ])
 
 
@@ -866,72 +865,10 @@ with tab_extract:
 
 
 # ==============================================================================
-# タブ 2: AI一括強化 (全未処理スライドのシーケンシャル生成)
-# ==============================================================================
-with tab_ai_batch:
-    st.subheader("Gemini Flash による一括スライドAI強化")
-    unprocessed = [f for f in b_images if os.path.basename(f) not in ai_cache]
-
-    st.write(f"検出されたBack画像: **{len(b_images)} 枚**（うち未処理: **{len(unprocessed)} 枚**）")
-
-    if unprocessed:
-        u_stats = load_api_usage_stats()
-        est_in_per_slide = u_stats["avg_in_std"]
-        est_out_per_slide = u_stats["avg_out_std"]
-        in_tokens = len(unprocessed) * est_in_per_slide
-        out_tokens = len(unprocessed) * est_out_per_slide
-
-        st.markdown(f"#### モデル別 費用試算（未処理 {len(unprocessed)} 枚分｜実測基準: 入力 {est_in_per_slide:,} / 出力+思考 {est_out_per_slide:,} tok/枚）")
-        calc_rows = []
-        for name, spec in PRICING_MODELS.items():
-            cost_usd = (in_tokens / 1_000_000 * spec["in"]) + (out_tokens / 1_000_000 * spec["out"])
-            cost_jpy = cost_usd * USD_JPY
-            calc_rows.append({
-                "モデル": name,
-                "全体費用 (JPY)": f"約 {cost_jpy:.2f} 円",
-                "1枚あたり": f"{(cost_jpy/len(unprocessed)):.2f} 円",
-                "USD換算": f"${cost_usd:.4f}"
-            })
-        st.table(calc_rows)
-
-        model_options = list(PRICING_MODELS.keys())
-        default_batch_idx = next((i for i, k in enumerate(model_options) if "3.6 Flash" in k), 0)
-        sel_model_name = st.selectbox("使用するモデル", model_options, index=default_batch_idx)
-        model_id = PRICING_MODELS[sel_model_name]["id"]
-
-        is_approved = st.checkbox("上記費用の試算を確認し、一括実行を承認します", value=False)
-        if st.button("🚀 承認して一括AI解説を生成", type="primary", disabled=not (is_approved and api_key)):
-            pbar = st.progress(0)
-            status_box = st.empty()
-            batch_actual_jpy = 0.0
-            batch_actual_tokens = 0
-            
-            for idx, img_path in enumerate(unprocessed):
-                fn = os.path.basename(img_path)
-                status_box.text(f"解説作成中 ({idx+1}/{len(unprocessed)}): {fn}")
-                try:
-                    html_text, u_rec = call_gemini_enhance(img_path, api_key, model_id, return_usage=True)
-                    ai_cache[fn] = html_text
-                    save_ai_cache(ai_cache)
-                    batch_actual_jpy += u_rec["cost_jpy"]
-                    batch_actual_tokens += u_rec["total_tokens"]
-                    st.session_state.pop(f"edit_html_{fn}", None)
-                except Exception as e:
-                    st.error(f"{fn} でAPIエラー発生: {e}")
-                    break
-                pbar.progress((idx + 1) / len(unprocessed))
-            
-            status_box.success(f"一括生成が完了しました！ 実測合計: 約 {batch_actual_jpy:.2f} 円 ({batch_actual_tokens:,} tok)")
-            st.rerun()
-    else:
-        st.success("すべてのスライドのAI解説が完了済みです。")
-
-
-# ==============================================================================
-# タブ 3: 個別スライド確認 & 複数選択バッチ並列生成
+# タブ 2: 個別スライド確認 & 複数選択バッチ並列生成・休止管理
 # ==============================================================================
 with tab_ai_inspect:
-    st.subheader("個別スライドの確認・プロンプト再生成 & 複数選択バッチ生成")
+    st.subheader("スライド確認・AI解説生成 & 休止管理")
     if b_images:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
@@ -1131,7 +1068,7 @@ with tab_ai_inspect:
                 value=is_cur_in_batch,
                 key=nav_batch_key,
                 on_change=on_nav_batch_toggle(fn, nav_batch_key),
-                help="一括AI生成の対象に含める"
+                help="一括AI生成・一括休止の対象に含める"
             )
         with nav_3:
             if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), width="stretch"):
@@ -1551,7 +1488,7 @@ with tab_ai_inspect:
 
 
 # ==============================================================================
-# タブ 4: Ankiデッキパッケージ (.apkg) 出力
+# タブ 3: Ankiデッキパッケージ (.apkg) 出力
 # ==============================================================================
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
