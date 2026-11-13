@@ -1148,7 +1148,7 @@ with tab_ai_inspect:
                 label_visibility="collapsed",
             )
 
-            sv_col1, sv_col2, sv_col3 = st.columns([2, 1, 1.2])
+            sv_col1, sv_col2, sv_col3 = st.columns([2, 0.9, 1.3])
             with sv_col1:
                 prompt_name = st.text_input("プロンプト保存名", placeholder="名前をつけて保存...", label_visibility="collapsed")
             with sv_col2:
@@ -1161,12 +1161,41 @@ with tab_ai_inspect:
             with sv_col3:
                 prompt_js = json.dumps(custom_prompt)
                 copy_btn_html = f"""
-                <button onclick='navigator.clipboard.writeText({prompt_js}); alert("プロンプトをクリップボードにコピーしました！");' 
-                        style="width: 100%; height: 38px; background-color: #f1f5f9; color: #1e293b; border: 1px solid #cbd5e1; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;">
-                    📋 Promptコピー
+                <style>
+                    html, body {{
+                        margin: 0;
+                        padding: 0;
+                        background: transparent;
+                        overflow: hidden;
+                    }}
+                    .copy-btn {{
+                        width: 100%;
+                        height: 38px;
+                        background-color: #262730;
+                        color: #fafafa;
+                        border: 1px solid rgba(250, 250, 250, 0.2);
+                        border-radius: 0.5rem;
+                        cursor: pointer;
+                        font-size: 14px;
+                        font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", sans-serif;
+                        white-space: nowrap;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        gap: 4px;
+                        box-sizing: border-box;
+                        transition: border-color 0.15s, color 0.15s;
+                    }}
+                    .copy-btn:hover {{
+                        border-color: #ff4b4b;
+                        color: #ff4b4b;
+                    }}
+                </style>
+                <button class="copy-btn" onclick='navigator.clipboard.writeText({prompt_js}); this.innerText="✅ コピー済"; setTimeout(()=>this.innerText="📋 コピー", 1500);'>
+                    📋 コピー
                 </button>
                 """
-                st.components.v1.html(copy_btn_html, height=42)
+                st.components.v1.html(copy_btn_html, height=40)
 
             model_labels = list(PRICING_MODELS.keys())
             default_inspect_idx = next((i for i, label in enumerate(model_labels) if "3.6 Flash" in label), 0)
