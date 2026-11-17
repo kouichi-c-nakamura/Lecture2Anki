@@ -7,17 +7,29 @@ import subprocess
 import shutil
 import io
 import base64
+import genanki
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from dotenv import load_dotenv
 from pipeline_util import (
     extract_pdf_pages,
     call_gemini_enhance,
+    call_gemini_summary_cloze,
     build_apkg,
     get_poppler_path,
     restore_from_anki_export,
+    load_guid_map_from_dir,
+    save_guid_map_to_dir,
+    load_ai_cache_from_dir,
+    save_ai_cache_to_dir,
+    load_summary_cloze_from_dir,
+    save_summary_cloze_to_dir,
+    strip_embedded_style,
+    renumber_cloze_spans,
     DEFAULT_PROMPT,
     SVG_OVERLAY_PROMPT,
+    DYNAMIC_CLOZE_CSS,
+    WEB_LLM_COPY_PROMPT,
 )
 
 # ==============================================================================
@@ -39,7 +51,6 @@ load_dotenv()
 LAST_WORK_DIR_FILE = os.path.expanduser("~/.last_work_dir")
 LEGACY_PRESETS_FILE = "lecture_presets.json"
 FOLDER_CONFIG_FILENAME = "lecture_config.json"
-CACHE_FILE = "exported_jpgs/ai_notes_cache.json"
 DEST_DIR = "exported_jpgs"
 PROMPTS_FILE = "custom_prompts.json"
 API_USAGE_LOG_FILE = os.path.join(DEST_DIR, "api_usage_log.jsonl")
@@ -57,6 +68,12 @@ USD_JPY = 155.0
 # ==============================================================================
 # フォルダ単位設定ロード・永続化ヘルパー
 # ==============================================================================
+def get_active_work_dir():
+    bf = st.session_state.get("base_folder_val", "").strip()
+    if bf and os.path.isdir(bf):
+        return bf
+    return None
+
 def get_last_folder():
     if os.path.exists(LAST_WORK_DIR_FILE):
         try:
@@ -165,7 +182,6 @@ def save_folder_config(folder_path, config_data):
     return True
 
 def safe_set_state(key, value):
-    """ウィジェット描画前なら直接セットし、描画後なら保留キューに退避する"""
     try:
         st.session_state[key] = value
     except Exception:
@@ -203,31 +219,27 @@ def apply_folder_to_state(folder_path, explicit_masked=None, explicit_unmasked=N
 
 
 # ==============================================================================
-# AI解説キャッシュ管理 & GUID Map & API利用実績集計
+# 3つのJSONキャッシュ管理（すべて現在の講義フォルダ直下に完全分離）
 # ==============================================================================
 def get_ai_cache():
-    return json.load(open(CACHE_FILE, "r", encoding="utf-8")) if os.path.exists(CACHE_FILE) else {}
+    return load_ai_cache_from_dir(get_active_work_dir())
 
 def save_ai_cache(data):
-    os.makedirs(DEST_DIR, exist_ok=True)
-    json.dump(data, open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    save_ai_cache_to_dir(data, get_active_work_dir())
 
 def get_guid_map():
-    p = os.path.join(DEST_DIR, "guid_map.json")
-    if os.path.exists(p):
-        try:
-            return json.load(open(p, "r", encoding="utf-8"))
-        except Exception:
-            pass
-    return {"deck_name": "", "notetype_name": "Medical AI Slide Model", "notes": {}}
+    return load_guid_map_from_dir(get_active_work_dir())
 
 def save_guid_map(data):
-    os.makedirs(DEST_DIR, exist_ok=True)
-    p = os.path.join(DEST_DIR, "guid_map.json")
-    json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    save_guid_map_to_dir(data, get_active_work_dir())
+
+def get_summary_cloze():
+    return load_summary_cloze_from_dir(get_active_work_dir())
+
+def save_summary_cloze(cards_list):
+    save_summary_cloze_to_dir(cards_list, get_active_work_dir())
 
 def load_api_usage_stats():
-    """過去のapi_usage_log.jsonlから累計実績と平均トークン数を算出する"""
     records = []
     if os.path.exists(API_USAGE_LOG_FILE):
         try:
@@ -254,7 +266,7 @@ def load_api_usage_stats():
     total_jpy = sum(r.get("cost_jpy", 0.0) for r in records)
     total_tokens = sum(r.get("total_tokens", 0) for r in records)
 
-    std_recs = [r for r in records if not r.get("is_svg")]
+    std_recs = [r for r in records if not r.get("is_svg") and not str(r.get("image", "")).startswith("SUMMARY_BATCH")]
     svg_recs = [r for r in records if r.get("is_svg")]
 
     avg_in_std = int(sum(r["prompt_tokens"] for r in std_recs[-20:]) / len(std_recs[-20:])) if std_recs else 2800
@@ -276,7 +288,7 @@ def load_api_usage_stats():
 
 
 # ==============================================================================
-# macOS クリップボード連携
+# macOS クリップボード連携 & HTMLコピーボタンレンダラ
 # ==============================================================================
 def copy_image_to_clipboard_macos(image_path):
     abs_path = os.path.abspath(image_path)
@@ -295,6 +307,46 @@ def copy_image_to_clipboard_macos(image_path):
     '''
     res = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
     return res.returncode == 0
+
+def render_clipboard_button(text_to_copy, label="📋 コピー", height=40):
+    text_js = json.dumps(text_to_copy)
+    label_js = json.dumps(label)
+    btn_html = f"""
+    <style>
+        html, body {{
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            overflow: hidden;
+        }}
+        .copy-btn {{
+            width: 100%;
+            height: 38px;
+            background-color: #262730;
+            color: #fafafa;
+            border: 1px solid rgba(250, 250, 250, 0.2);
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-size: 14px;
+            font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", sans-serif;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            box-sizing: border-box;
+            transition: border-color 0.15s, color 0.15s;
+        }}
+        .copy-btn:hover {{
+            border-color: #ff4b4b;
+            color: #ff4b4b;
+        }}
+    </style>
+    <button class="copy-btn" onclick='navigator.clipboard.writeText({text_js}); this.innerText="✅ コピー済"; setTimeout(()=>this.innerText={label_js}, 1500);'>
+        {label}
+    </button>
+    """
+    st.components.v1.html(btn_html, height=height)
 
 
 # ==============================================================================
@@ -536,7 +588,7 @@ def on_unmasked_input_change():
 with st.sidebar:
     st.header("講義フォルダ・デッキ設定")
     
-    st.markdown("**📂 講義フォルダ (PDF選択時に自動同期)**")
+    st.markdown("**📂 講義フォルダ (3つのJSON保存先)**")
     col_bf1, col_bf2 = st.columns([3.2, 1])
     with col_bf2:
         if st.button("📂 選択", key="btn_choose_bf", help="Finderで講義フォルダを選択", width="stretch"):
@@ -610,7 +662,6 @@ with st.sidebar:
     st.markdown("---")
     api_key = st.text_input("Gemini API Key", type="password", value=os.environ.get("GEMINI_API_KEY", ""))
 
-    # API実測コストサマリー表示
     u_stats = load_api_usage_stats()
     st.markdown("**📊 API実測コスト累計（ローカル記録）**")
     st.caption(
@@ -621,7 +672,7 @@ with st.sidebar:
     if u_stats["recent"]:
         with st.expander("直近の実測トークン履歴 (最新10件)", expanded=False):
             for r in u_stats["recent"]:
-                mode_tag = "🎯SVG" if r.get("is_svg") else "標準"
+                mode_tag = "⚡要約" if str(r.get("image", "")).startswith("SUMMARY_BATCH") else ("🎯SVG" if r.get("is_svg") else "標準")
                 st.markdown(
                     f"<div style='font-size:11px; border-bottom:1px solid #334155; padding:4px 0;'>"
                     f"<b>{r['image']}</b> ({mode_tag})<br>"
@@ -633,6 +684,8 @@ with st.sidebar:
 # セッション状態変数の初期化
 if "slide_idx" not in st.session_state:
     st.session_state.slide_idx = 0
+if "summary_idx" not in st.session_state:
+    st.session_state.summary_idx = 0
 if "custom_prompt_val" not in st.session_state:
     st.session_state.custom_prompt_val = DEFAULT_PROMPT
 if "selected_batch_slides" not in st.session_state:
@@ -649,20 +702,22 @@ if all_b_images:
     b_images = [f for f in all_b_images if os.path.basename(f).startswith(latest_ts)]
 
 ai_cache = get_ai_cache()
+summary_cards = get_summary_cloze()
 
 
 # ==============================================================================
-# メイン画面タブ構成（3タブにシンプル化）
+# メイン画面タブ構成（4タブ構成）
 # ==============================================================================
-tab_extract, tab_ai_inspect, tab_build = st.tabs([
-    "1. PDF指定 & 抽出", 
-    "2. 🔍 AI解説 & バッチ生成・休止管理", 
-    "3. 📦 Ankiパッケージ出力"
+tab_extract, tab_ai_inspect, tab_summary_cloze, tab_build = st.tabs([
+    "1. PDF指定 & 抽出 / 復元", 
+    "2. 🔍 個別スライド解説 & 休止管理", 
+    "3. ⚡ 要約圧縮ダイナミックCloze",
+    "4. 📦 Ankiパッケージ出力"
 ])
 
 
 # ==============================================================================
-# タブ 1: PDFファイルの指定とJPEG書き出し
+# タブ 1: PDFファイルの指定とJPEG書き出し ＆ 既存Ankiデッキ復元
 # ==============================================================================
 with tab_extract:
     st.subheader("PDFファイルの指定とJPEG書き出し")
@@ -782,7 +837,14 @@ with tab_extract:
                             "unmasked_pdf": unmasked_pdf,
                             "masked_pdf": st.session_state.get("masked_pdf_val", ""),
                         })
-                    ts, cnt = extract_pdf_pages(unmasked_pdf, masked_pdf if mode == "事前Cloze済み (Masked PDFあり)" else None, pages_str, pdf_pass)
+                    ts, cnt = extract_pdf_pages(
+                        unmasked_pdf,
+                        masked_pdf if mode == "事前Cloze済み (Masked PDFあり)" else None,
+                        pages_str,
+                        pdf_pass,
+                        dest_dir=DEST_DIR,
+                        work_dir=get_active_work_dir(),
+                    )
                     st.session_state.selected_batch_slides = set()
                     st.success(f"完了: {cnt} ページ分の画像（a/bペア）を exported_jpgs に書き出しました。")
                     st.rerun()
@@ -793,11 +855,11 @@ with tab_extract:
             subprocess.run(["open", os.path.abspath(DEST_DIR)])
 
     # --------------------------------------------------------------------------
-    # 既存Ankiデッキからの作業状態復元
+    # 既存Ankiデッキからの作業状態復元（2モデル自動振り分け対応）
     # --------------------------------------------------------------------------
     st.markdown("---")
     st.subheader("🔄 既存Ankiデッキ（ノート書き出し .txt）からの作業状態復元")
-    st.caption("すでにAnkiに登録済みのカードから、画像・GUID・既存AI解説をローカル環境へ復元します。")
+    st.caption("すでにAnkiに登録済みのカードから、スライド画像・GUID・個別AI解説・要約Clozeカードを講義フォルダの3つのJSONへ自動振り分け復元します。")
 
     if "anki_txt_path_val" not in st.session_state:
         st.session_state.anki_txt_path_val = ""
@@ -823,28 +885,42 @@ with tab_extract:
             st.session_state.restore_msg = ("error", f"指定された .txt ファイルが見つかりません: '{txt_p}'")
             return
 
+        # .txt の親フォルダが有効かつ講義フォルダ未設定なら自動同期
+        txt_dir = os.path.dirname(txt_p)
+        if not get_active_work_dir() and txt_dir and os.path.isdir(txt_dir):
+            safe_set_state("base_folder_val", txt_dir)
+
         try:
-            res = restore_from_anki_export(txt_p, med_d if med_d else None, DEST_DIR)
+            res = restore_from_anki_export(
+                txt_p,
+                med_d if med_d else None,
+                DEST_DIR,
+                work_dir=get_active_work_dir() or txt_dir,
+            )
             st.cache_data.clear()
             st.session_state.slide_idx = 0
+            st.session_state.summary_idx = 0
             st.session_state.selected_batch_slides = set()
             
             if res.get("deck_name"):
                 d_name = res["deck_name"]
-                st.session_state.deck_name_val = d_name
+                safe_set_state("deck_name_val", d_name)
                 if "::" in d_name:
                     p, g = d_name.split("::", 1)
-                    st.session_state.parent_deck_val = p.strip()
-                    st.session_state.group_title_val = g.strip()
+                    safe_set_state("parent_deck_val", p.strip())
+                    safe_set_state("parent_deck_input", p.strip())
+                    safe_set_state("group_title_val", g.strip())
+                    safe_set_state("group_title_input", g.strip())
                 else:
-                    st.session_state.group_title_val = d_name
+                    safe_set_state("group_title_val", d_name)
+                    safe_set_state("group_title_input", d_name)
                     
             st.session_state.restore_msg = ("success", res)
         except Exception as e:
             st.session_state.restore_msg = ("error", f"復元中にエラーが発生しました: {e}")
         
     st.button(
-        "♻️ Ankiエクスポートから画像・既存AI解説・GUIDを復元",
+        "♻️ Ankiエクスポートから画像・既存AI解説・要約Cloze・GUIDを復元",
         key="btn_run_restore_anki",
         width="stretch",
         on_click=on_restore_anki_click,
@@ -856,8 +932,9 @@ with tab_extract:
             st.error(m_val)
         elif m_type == "success":
             st.success(
-                f"✅ 復元成功！ ノート数: {m_val['restored_notes']} 枚 / "
-                f"AI解説: {m_val['restored_ai']} 件 / "
+                f"✅ 復元成功！ スライドノート: {m_val['restored_notes']} 枚 / "
+                f"個別AI解説: {m_val['restored_ai']} 件 / "
+                f"要約Clozeカード: {m_val.get('restored_summary', 0)} 枚 / "
                 f"コピー画像: {m_val['copied_images']} 枚"
             )
             if m_val["missing_images"]:
@@ -865,10 +942,10 @@ with tab_extract:
 
 
 # ==============================================================================
-# タブ 2: 個別スライド確認 & 複数選択バッチ並列生成・休止管理
+# タブ 2: 個別スライド確認 & 複数選択バッチ並列生成・休止管理（従来グリッドに専念）
 # ==============================================================================
 with tab_ai_inspect:
-    st.subheader("スライド確認・AI解説生成 & 休止管理")
+    st.subheader("スライド確認・個別AI解説生成 & 休止管理")
     if b_images:
         total_slides = len(b_images)
         st.session_state.slide_idx = max(0, min(st.session_state.slide_idx, total_slides - 1))
@@ -1068,7 +1145,7 @@ with tab_ai_inspect:
                 value=is_cur_in_batch,
                 key=nav_batch_key,
                 on_change=on_nav_batch_toggle(fn, nav_batch_key),
-                help="一括AI生成・一括休止の対象に含める"
+                help="一括AI生成・一括休止・要約圧縮の対象に含める"
             )
         with nav_3:
             if st.button("次のスライド ➡️", key="btn_next_slide", disabled=(st.session_state.slide_idx >= total_slides - 1), width="stretch"):
@@ -1159,43 +1236,7 @@ with tab_ai_inspect:
                         st.success(f"'{prompt_name}' を保存しました")
                         st.rerun()
             with sv_col3:
-                prompt_js = json.dumps(custom_prompt)
-                copy_btn_html = f"""
-                <style>
-                    html, body {{
-                        margin: 0;
-                        padding: 0;
-                        background: transparent;
-                        overflow: hidden;
-                    }}
-                    .copy-btn {{
-                        width: 100%;
-                        height: 38px;
-                        background-color: #262730;
-                        color: #fafafa;
-                        border: 1px solid rgba(250, 250, 250, 0.2);
-                        border-radius: 0.5rem;
-                        cursor: pointer;
-                        font-size: 14px;
-                        font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", sans-serif;
-                        white-space: nowrap;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        gap: 4px;
-                        box-sizing: border-box;
-                        transition: border-color 0.15s, color 0.15s;
-                    }}
-                    .copy-btn:hover {{
-                        border-color: #ff4b4b;
-                        color: #ff4b4b;
-                    }}
-                </style>
-                <button class="copy-btn" onclick='navigator.clipboard.writeText({prompt_js}); this.innerText="✅ コピー済"; setTimeout(()=>this.innerText="📋 コピー", 1500);'>
-                    📋 コピー
-                </button>
-                """
-                st.components.v1.html(copy_btn_html, height=40)
+                render_clipboard_button(custom_prompt, label="📋 コピー")
 
             model_labels = list(PRICING_MODELS.keys())
             default_inspect_idx = next((i for i, label in enumerate(model_labels) if "3.6 Flash" in label), 0)
@@ -1212,7 +1253,6 @@ with tab_ai_inspect:
             chosen_spec = PRICING_MODELS[sel_inspect_label]
             sel_inspect_model = chosen_spec["id"]
 
-            # 実測平均ベースの単価試算
             u_stats_now = load_api_usage_stats()
             is_svg_now = "svg-overlay-wrap" in custom_prompt
             est_in = u_stats_now["avg_in_svg"] if is_svg_now else u_stats_now["avg_in_std"]
@@ -1514,10 +1554,254 @@ with tab_ai_inspect:
                         st.session_state.pop(edit_key, None)
                         st.info("AI解説を消去しました。")
                         st.rerun()
+    else:
+        st.info("スライド画像がまだありません。タブ1でPDFから抽出するか、既存Ankiデッキから復元してください。")
 
 
 # ==============================================================================
-# タブ 3: Ankiデッキパッケージ (.apkg) 出力
+# タブ 3: ⚡ 要約圧縮ダイナミックCloze（新設 Medical Dynamic Cloze Model 専用）
+# ==============================================================================
+with tab_summary_cloze:
+    st.subheader("⚡ 要約圧縮ダイナミックCloze (Medical Dynamic Cloze Model)")
+    st.caption("文字や薬品名・病原体名の羅列が多い講義資料を少数の構造化カードに圧縮し、タップ開閉式のClozeカードとして同じデッキの末尾に追加します。")
+
+    # 1. Gemini API による一括要約生成パネル
+    with st.container(border=True):
+        st.markdown("##### 🚀 1. スライド群から要約Clozeカードを一括生成 (Gemini API)")
+        sc_col1, sc_col2, sc_col3 = st.columns([1.6, 1.1, 1.5])
+
+        with sc_col1:
+            active_non_sus = [f for f in b_images if not notes_meta.get(os.path.basename(f), {}).get("is_suspended", False)]
+            batch_sel_imgs = [f for f in b_images if os.path.basename(f) in st.session_state.selected_batch_slides]
+            scope_options = [
+                f"全スライド ({len(b_images)} 枚)",
+                f"休止を除く有効スライドのみ ({len(active_non_sus)} 枚)",
+                f"タブ2で『🎯 対象』に選択中のスライド ({len(batch_sel_imgs)} 枚)",
+            ]
+            sel_scope = st.selectbox("要約元の対象スライド", scope_options, index=0)
+            if "有効スライドのみ" in sel_scope:
+                target_summary_imgs = active_non_sus
+            elif "選択中のスライド" in sel_scope:
+                target_summary_imgs = batch_sel_imgs
+            else:
+                target_summary_imgs = b_images
+
+        with sc_col2:
+            target_ch_count = st.number_input("目標圧縮カード枚数 (Chapter数)", min_value=1, max_value=25, value=8, step=1)
+
+        with sc_col3:
+            model_labels_sc = list(PRICING_MODELS.keys())
+            def_sc_idx = next((i for i, label in enumerate(model_labels_sc) if "3.6 Flash" in label), 0)
+            sel_sc_model_label = st.selectbox("使用モデル", model_labels_sc, index=def_sc_idx, key="sel_sc_model")
+            sc_spec = PRICING_MODELS[sel_sc_model_label]
+            sc_model_id = sc_spec["id"]
+
+            # 1枚あたり約450入力トークン + チャプターあたり約1200出力トークンで概算
+            est_sc_in = len(target_summary_imgs) * 450 + 1000
+            est_sc_out = int(target_ch_count) * 1400
+            est_sc_usd = (est_sc_in / 1_000_000 * sc_spec["in"]) + (est_sc_out / 1_000_000 * sc_spec["out"])
+            est_sc_jpy = est_sc_usd * USD_JPY
+            st.caption(f"💰 一括生成 推定コスト: **約 {est_sc_jpy:.2f} 円** (`${est_sc_usd:.4f}`)")
+
+        extra_inst = st.text_input(
+            "追加の要約指示（任意：重点を置きたい薬品群・病原体・表の軸など）",
+            placeholder="例: 抗菌薬のスペクトラムと第一選択薬の比較表を必ず含めること / 副作用と禁忌を重点的にCloze化すること",
+        )
+
+        btn_sc_col1, btn_sc_col2 = st.columns([2, 1])
+        with btn_sc_col1:
+            if st.button(
+                f"⚡ {len(target_summary_imgs)} 枚のスライドから {target_ch_count} 枚の要約Clozeを一括生成",
+                type="primary",
+                disabled=(len(target_summary_imgs) == 0 or not api_key),
+                width="stretch",
+            ):
+                with st.spinner(f"スライド {len(target_summary_imgs)} 枚を統合分析し、全 {target_ch_count} チャプターのダイナミックClozeを作成中..."):
+                    try:
+                        deck_title_str = st.session_state.get("group_title_val") or st.session_state.get("deck_name_val") or "講義要約"
+                        new_cards, u_rec = call_gemini_summary_cloze(
+                            img_paths=target_summary_imgs,
+                            api_key=api_key,
+                            model_id=sc_model_id,
+                            target_count=int(target_ch_count),
+                            deck_title=deck_title_str,
+                            extra_instruction=extra_inst,
+                            existing_cards=summary_cards,
+                        )
+                        save_summary_cloze(new_cards)
+                        for c in new_cards:
+                            st.session_state.pop(f"edit_sum_html_{c['chapter_idx']}", None)
+                            st.session_state.pop(f"edit_sum_title_{c['chapter_idx']}", None)
+                        st.session_state.summary_idx = 0
+                        st.toast(f"✅ 要約Cloze {len(new_cards)} 枚を生成しました！（実測: 約 {u_rec['cost_jpy']:.2f} 円）")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"要約Cloze一括生成中にエラーが発生しました: {e}")
+
+        with btn_sc_col2:
+            if st.button("➕ 空の要約カードを1枚新規追加 (手動貼り付け用)", width="stretch"):
+                next_ch = (max([c.get("chapter_idx", 0) for c in summary_cards]) + 1) if summary_cards else 1
+                deck_title_str = st.session_state.get("group_title_val") or st.session_state.get("deck_name_val") or "講義要約"
+                new_guid = genanki.guid_for(f"{deck_title_str}_summary_ch{next_ch:02d}")
+                template_initial = (
+                    f'<div class="meta-header">{deck_title_str}（Chapter {next_ch}）</div>\n'
+                    f'<div class="question-box">{next_ch}. 新規チャプタータイトル</div>\n'
+                    f'<div class="feature-box"><b>要点：</b>ここに要約または外部LLMで作成したHTMLを貼り付けてください。</div>'
+                )
+                summary_cards.append({
+                    "guid": new_guid,
+                    "chapter_idx": next_ch,
+                    "title": f"{next_ch}. 新規チャプター",
+                    "html": template_initial,
+                    "is_suspended": False,
+                    "tags": [],
+                })
+                save_summary_cloze(summary_cards)
+                st.session_state.summary_idx = len(summary_cards) - 1
+                st.rerun()
+
+    # 2. 生成済み要約Clozeカードのプレビュー＆個別編集セクション
+    st.markdown("---")
+    if summary_cards:
+        total_sum = len(summary_cards)
+        st.session_state.summary_idx = max(0, min(st.session_state.summary_idx, total_sum - 1))
+
+        st.markdown(f"##### 📑 2. 要約Clozeカード一覧 ({total_sum} 枚) ＆ プレビュー・HTML編集")
+        ch_cols = st.columns(min(total_sum, 8))
+        for idx, c_item in enumerate(summary_cards):
+            col_target = ch_cols[idx % len(ch_cols)]
+            with col_target:
+                ch_num = c_item.get("chapter_idx", idx + 1)
+                sus_mark = "⏸️" if c_item.get("is_suspended") else "⚡"
+                is_cur_sc = (idx == st.session_state.summary_idx)
+                if st.button(
+                    f"Ch.{ch_num} {sus_mark}",
+                    key=f"btn_sel_sum_{idx}",
+                    type="primary" if is_cur_sc else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state.summary_idx = idx
+                    st.rerun()
+
+        cur_card = summary_cards[st.session_state.summary_idx]
+        cur_ch_idx = cur_card.get("chapter_idx", st.session_state.summary_idx + 1)
+
+        s_nav1, s_nav2, s_nav3, s_nav4, s_nav5 = st.columns([1.1, 2.5, 1.0, 1.1, 1.1])
+        with s_nav1:
+            if st.button("⬅️ 前のCh", disabled=(st.session_state.summary_idx == 0), width="stretch"):
+                st.session_state.summary_idx -= 1
+                st.rerun()
+        with s_nav2:
+            st.markdown(
+                f"<div style='text-align:center; padding-top:6px; font-weight:bold;'>"
+                f"Chapter {cur_ch_idx} ({st.session_state.summary_idx + 1} / {total_sum}) ｜ GUID: <code>{cur_card.get('guid', '')[:10]}</code></div>",
+                unsafe_allow_html=True,
+            )
+        with s_nav3:
+            sum_sus_key = f"chk_sum_sus_{cur_ch_idx}"
+            is_sc_sus = cur_card.get("is_suspended", False)
+            new_sc_sus = st.checkbox("⏸️ 休止", value=is_sc_sus, key=sum_sus_key)
+            if new_sc_sus != is_sc_sus:
+                cur_card["is_suspended"] = new_sc_sus
+                save_summary_cloze(summary_cards)
+                st.rerun()
+        with s_nav4:
+            if st.button("🔢 Cloze連番振直", help="カード内の 1. 2. 3. の連番を1から順番に自動修正します", width="stretch"):
+                cur_card["html"] = renumber_cloze_spans(cur_card.get("html", ""))
+                save_summary_cloze(summary_cards)
+                st.session_state.pop(f"edit_sum_html_{cur_ch_idx}", None)
+                st.toast("✅ Cloze番号を 1. から連番に振り直しました")
+                st.rerun()
+        with s_nav5:
+            if st.button("次のCh ➡️", disabled=(st.session_state.summary_idx >= total_sum - 1), width="stretch"):
+                st.session_state.summary_idx += 1
+                st.rerun()
+
+        # 実機互換プレビュー（ホバー＆クリック開閉＋全表示切替ボタン付き）
+        preview_dc_html = f"""
+        <style>
+            html, body {{
+                margin: 0;
+                padding: 8px;
+                background: #e2e8f0;
+            }}
+            {DYNAMIC_CLOZE_CSS}
+        </style>
+        <div class="card" id="dc-preview-root" style="border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                <span style="font-size:11px; color:#64748b;">💡 黄色いCloze箇所にホバーまたはクリックで解答表示（右ボタンで全開切替）</span>
+                <button type="button" onclick="document.getElementById('dc-preview-root').classList.toggle('back-view');" 
+                        style="font-size:11px; padding:3px 10px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1e293b; cursor:pointer; font-weight:600;">
+                    👁️ 全表示 / 隠す (Back面確認)
+                </button>
+            </div>
+            {cur_card.get("html", "")}
+        </div>
+        <script>
+            document.querySelectorAll('#dc-preview-root .cloze-container').forEach(function(el) {{
+                el.addEventListener('click', function() {{
+                    this.classList.toggle('revealed');
+                }});
+            }});
+        </script>
+        """
+        st.components.v1.html(preview_dc_html, height=500, scrolling=True)
+
+        # 個別HTML編集・貼り付けエリア
+        title_key = f"edit_sum_title_{cur_ch_idx}"
+        html_key = f"edit_sum_html_{cur_ch_idx}"
+        if title_key not in st.session_state:
+            st.session_state[title_key] = cur_card.get("title", f"Chapter {cur_ch_idx}")
+        if html_key not in st.session_state:
+            st.session_state[html_key] = cur_card.get("html", "")
+
+        with st.container(border=True):
+            ed_c1, ed_c2 = st.columns([4, 1])
+            with ed_c1:
+                new_title_val = st.text_input("Chapterタイトル (ChapterTitleフィールド)", key=title_key)
+                new_html_val = st.text_area(
+                    "BodyHTML ソースコード（<style>付きで貼り付けても保存時に自動で剥がしてクリーン化します）",
+                    key=html_key,
+                    height=240,
+                )
+            with ed_c2:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if st.button("💾 このChを保存", type="primary", width="stretch"):
+                    cleaned = strip_embedded_style(new_html_val)
+                    cur_card["title"] = new_title_val.strip() or f"Chapter {cur_ch_idx}"
+                    cur_card["html"] = cleaned
+                    save_summary_cloze(summary_cards)
+                    st.session_state.pop(html_key, None)
+                    st.toast(f"✅ Chapter {cur_ch_idx} を保存しました！")
+                    st.rerun()
+
+                render_clipboard_button(cur_card.get("html", ""), label="📋 HTMLコピー")
+
+                if st.button("🗑️ このChを削除", width="stretch"):
+                    summary_cards.pop(st.session_state.summary_idx)
+                    save_summary_cloze(summary_cards)
+                    st.session_state.summary_idx = max(0, st.session_state.summary_idx - 1)
+                    st.rerun()
+    else:
+        st.info("まだ要約圧縮ダイナミックClozeカードがありません。上のボタンからAPI一括生成するか、「➕ 空の要約カードを1枚新規追加」してHTMLを貼り付けてください。")
+
+    # 3. 最下部：外部LLM App（ChatGPT / Claude / Gemini Web等）での作業用プロンプト＆CSSコピー欄
+    st.markdown("---")
+    st.markdown("#### 📋 3. 外部LLM App（定額制Webチャット等）で個別作成・手直しするためのプロンプト")
+    st.caption("PDFやテキスト、または修正したいカードのHTMLを外部のLLMアプリに貼り付けて作業する際、以下のプロンプトをコピーして渡してください。")
+
+    pr_col1, pr_col2 = st.columns([4, 1])
+    with pr_col1:
+        st.code(WEB_LLM_COPY_PROMPT, language="text")
+    with pr_col2:
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+        render_clipboard_button(WEB_LLM_COPY_PROMPT, label="📋 プロンプトをコピー")
+        with st.expander("🎨 内蔵CSSを確認", expanded=False):
+            st.code(DYNAMIC_CLOZE_CSS, language="css")
+
+
+# ==============================================================================
+# タブ 4: Ankiデッキパッケージ (.apkg) 出力（元スライド先➔要約Cloze後の順序固定＆学習履歴保護警告）
 # ==============================================================================
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
@@ -1528,48 +1812,78 @@ with tab_build:
     bf = st.session_state.get("base_folder_val", "").strip()
     target_dir = bf if (bf and os.path.exists(bf)) else "."
     display_dir = os.path.abspath(target_dir)
-    st.info(f"📁 出力先フォルダ: `{display_dir}`")
+    st.info(f"📁 出力先フォルダ（および3つのJSON保存先）: `{display_dir}`")
+
+    gm_full = get_guid_map()
+    is_restored_deck = gm_full.get("is_restored_from_anki", False)
+    gm_notes = gm_full.get("notes", {})
 
     current_b_names = {os.path.basename(f) for f in b_images}
-    gm_latest = get_guid_map().get("notes", {})
-    suspended_count = sum(
+    suspended_slide_count = sum(
         1 for b_fn in current_b_names
-        if gm_latest.get(b_fn, {}).get("is_suspended", False)
+        if gm_notes.get(b_fn, {}).get("is_suspended", False)
+    )
+    suspended_sum_count = sum(
+        1 for c in summary_cards
+        if c.get("is_suspended", False)
+    )
+    total_suspended = suspended_slide_count + suspended_sum_count
+
+    # パッケージ内訳と格納順序の明示
+    st.markdown(
+        f"**📦 パッケージ格納順序（自動固定）:**\n"
+        f"1. **元スライド (`Medical AI Slide Model`)**: **{len(b_images)} 枚** （うち個別AI解説あり: {len(ai_cache)} 枚 / 休止設定: {suspended_slide_count} 枚）\n"
+        f"2. **要約圧縮Cloze (`Medical Dynamic Cloze Model`)**: **{len(summary_cards)} 枚** （うち休止設定: {suspended_sum_count} 枚）"
     )
 
-    if suspended_count > 0:
+    # ユースケース③（既存・学習中デッキ復元時）の最優先赤枠警告 vs 新規デッキ休止反映警告
+    if is_restored_deck:
+        st.error(
+            "🚨 **【最重要：既存・学習中デッキの更新モード（学習履歴の保護）】**\n\n"
+            "このデッキは既存のAnkiエクスポート（`.txt`）から復元されています。すでにAnki側にある学習履歴・復習期日・間隔を絶対に壊さないため、Ankiで `.apkg` を読み込む際は **「学習進捗も読み込む（Import any learning progress）」を必ず OFF（灰色）** にしてインポートしてください！\n"
+            "- ※誤って ON にすると、Anki側で積み上げた既存の学習履歴がすべて初期状態に上書きリセットされてしまいます。\n"
+            "- ※既存デッキのカード休止変更は、インポート後にAnkiブラウザ上で操作（`Cmd + J`）するのが最も安全です。"
+        )
+    elif total_suspended > 0:
         st.warning(
-            f"⚠️ **休止設定のスライドが {suspended_count} 枚含まれています（`queue = -1`）**\n\n"
+            f"⚠️ **休止設定のカードが合計 {total_suspended} 枚含まれています（`queue = -1`）**\n\n"
             f"Ankiで `.apkg` を読み込む際、インポート画面の **「学習進捗も読み込む（Import any learning progress）」** の設定に注意してください：\n"
-            f"- **【新規デッキの初回インポート時】**: **ON（青色）** にして読み込んでください。これにより休止設定がそのまま反映されます。\n"
-            f"- **【すでに学習中の既存デッキへの再インポート時】**: 学習履歴を守るため **OFF（灰色）** のまま読み込んでください（※ONにすると既存の復習期日がリセットされます）。"
+            f"- **【新規デッキの初回インポート時】**: **ON（青色）** にして読み込んでください。これにより休止設定（{total_suspended}枚）がそのまま反映されます。\n"
+            f"- **【すでにAnkiで学習を開始した後の再インポート時】**: 学習履歴を守るため **OFF（灰色）** のまま読み込んでください（※ONにすると既存の復習期日がリセットされます）。"
         )
     
     col_out1, col_out2 = st.columns([1, 1])
     with col_out1:
-        if st.button("📦 .apkg パッケージを作成", type="primary"):
-            with st.spinner("パッケージング中..."):
-                apkg_path, count = build_apkg(
+        if st.button("📦 .apkg パッケージを作成", type="primary", width="stretch"):
+            with st.spinner("パッケージング中（元スライド ➔ 要約Clozeの順で統合）..."):
+                apkg_path, total_cnt, s_cnt, dc_cnt = build_apkg(
                     DEST_DIR, 
                     deck_full_name, 
                     st.session_state.get("group_title_val", ""), 
                     get_ai_cache(), 
-                    output_dir=target_dir
+                    output_dir=target_dir,
+                    work_dir=get_active_work_dir(),
+                    summary_cards=summary_cards,
                 )
-                st.success(f"完成: {count} 枚のカードを含む '{os.path.basename(apkg_path)}' を保存しました！")
+                st.success(
+                    f"完成: 合計 {total_cnt} 枚（元スライド {s_cnt} 枚 ＋ 要約Cloze {dc_cnt} 枚）を含む "
+                    f"'{os.path.basename(apkg_path)}' を保存しました！"
+                )
                 st.caption(f"保存場所: `{apkg_path}`")
                 
-                if suspended_count > 0:
+                if is_restored_deck:
+                    st.error("🚨 **確認**: 既存デッキの更新です。Ankiインポート時は **「学習進捗も読み込む」を必ず OFF（灰色）** にしてください。")
+                elif total_suspended > 0:
                     st.error(
-                        f"🚨 **重要（休止カード {suspended_count} 枚を含む）**: "
-                        f"初回取り込み時は Anki の **「学習進捗も読み込む」を ON（青）** に設定してください。"
+                        f"🚨 **重要（休止カード {total_suspended} 枚を含む）**: "
+                        f"新規デッキの初回取り込み時は Anki の **「学習進捗も読み込む」を ON（青）** に設定してください（既習デッキの再インポート時は OFF）。"
                     )
                 else:
-                    st.info("※決定論的GUIDと正統Model IDにより、Ankiに再インポートしても学習進捗を維持したまま上書きされます。")
+                    st.info("※決定論的GUIDと2つの固定Model IDにより、Ankiに再インポートしても学習進捗を維持したまま安全に更新されます。")
 
     with col_out2:
-        if st.button("🗑️ 中間JPEG画像フォルダを全削除 (クリーンアップ)"):
+        if st.button("🗑️ 中間JPEG画像フォルダを全削除 (クリーンアップ)", width="stretch"):
             all_jpgs = glob.glob(os.path.join(DEST_DIR, "*.jpg"))
             for f in all_jpgs:
                 os.remove(f)
-            st.success(f"{len(all_jpgs)} 枚のJPEGを削除しました。")
+            st.success(f"{len(all_jpgs)} 枚のJPEGを削除しました（講義フォルダ内の3つのJSONは安全に保持されています）。")
