@@ -275,11 +275,7 @@ def identify_prompt_label(p_text):
 # ==============================================================================
 def log_api_usage(img_filename, model_id, prompt_tokens, output_tokens, thought_tokens, is_svg=False):
     os.makedirs(os.path.dirname(API_USAGE_LOG_FILE), exist_ok=True)
-    spec = MODEL_PRICING_PER_1M.get(model_id, {"in": 0.75, "out": 3.75})
-
-    total_out_billed = output_tokens + thought_tokens
-    cost_usd = (prompt_tokens / 1_000_000 * spec["in"]) + (total_out_billed / 1_000_000 * spec["out"])
-    cost_jpy = cost_usd * USD_JPY
+    calc = calculate_gemini_cost(model_id, prompt_tokens, output_tokens, thought_tokens)
 
     record = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -289,9 +285,9 @@ def log_api_usage(img_filename, model_id, prompt_tokens, output_tokens, thought_
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
         "thought_tokens": thought_tokens,
-        "total_tokens": prompt_tokens + total_out_billed,
-        "cost_usd": round(cost_usd, 6),
-        "cost_jpy": round(cost_jpy, 4),
+        "total_tokens": calc["total_tokens"],
+        "cost_usd": calc["cost_usd"],
+        "cost_jpy": calc["cost_jpy"],
     }
     try:
         with open(API_USAGE_LOG_FILE, "a", encoding="utf-8") as f:

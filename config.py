@@ -16,22 +16,7 @@ CANONICAL_MODEL_NAME = "Medical AI Slide Model"
 DYNAMIC_CLOZE_MODEL_ID = 851727059
 DYNAMIC_CLOZE_MODEL_NAME = "Medical Dynamic Cloze Model"
 
-PRICING_MODELS = {
-    "Gemini 3.6 Flash (バランス標準)":       {"id": "gemini-3.6-flash",      "in": 0.75, "out": 3.75},
-    "Gemini 3.5 Flash-Lite (最安推奨)":     {"id": "gemini-3.5-flash-lite", "in": 0.30, "out": 2.50},
-    "Gemini 3.8 Flash (高推論Flash)":       {"id": "gemini-3.8-flash",      "in": 0.75, "out": 3.75},
-    "Gemini 4 Argon (〜11/30 特割)":        {"id": "gemini-4-argon",        "in": 2.00, "out": 10.00},
-    "Gemini 4 Argon (12/1〜 通常)":         {"id": "gemini-4-argon",        "in": 4.00, "out": 20.00},
-}
-
-MODEL_PRICING_PER_1M = {
-    "gemini-3.6-flash":      {"in": 0.75, "out": 3.75},
-    "gemini-3.5-flash-lite": {"in": 0.30, "out": 2.50},
-    "gemini-3.8-flash":      {"in": 0.75, "out": 3.75},
-    "gemini-4-argon":        {"in": 2.00, "out": 10.00},
-}
-
-USD_JPY = 155.0
+from gemini_pricing import PRICING_MODELS, MODEL_PRICING_PER_1M, USD_JPY
 
 # ==============================================================================
 # 個別スライド解説用プロンプト
