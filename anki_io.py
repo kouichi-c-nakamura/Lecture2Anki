@@ -73,12 +73,17 @@ def get_canonical_model():
 
 
 def get_dynamic_cloze_model():
+    """
+    SortTitle / Front / Back の3フィールド構成。
+    - Front: ダイナミックCloze付きノート（個別タップ開閉＋全表示切替）
+    - Back : Cloze解除済みの見やすいノート ＋ LLM補足解説（.ai-container）
+    """
     qfmt = """
 <div class="card" id="dc-front-root">
   <div style="display:flex; justify-content:flex-end; margin-bottom:4px;">
     <button type="button" onclick="const el=document.getElementById('dc-front-root'); el.classList.toggle('back-view');" style="font-size:11px; padding:2px 8px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#475569; cursor:pointer;">👁️ 全表示切替</button>
   </div>
-  {{BodyHTML}}
+  {{Front}}
 </div>
 <script>
   document.querySelectorAll('#dc-front-root .cloze-container').forEach(function(el) {
@@ -90,15 +95,20 @@ def get_dynamic_cloze_model():
 """
     afmt = """
 <div class="card back-view">
-  {{BodyHTML}}
+  {{Back}}
 </div>
 """
+    combined_css = DYNAMIC_CLOZE_CSS + "\n" + CARD_CSS
     return genanki.Model(
-        DYNAMIC_CLOZE_MODEL_ID,
-        DYNAMIC_CLOZE_MODEL_NAME,
-        fields=[{'name': 'ChapterTitle'}, {'name': 'BodyHTML'}],
+        851727060,
+        "Medical Dynamic Cloze Model 3F",
+        fields=[
+            {'name': 'SortTitle'},
+            {'name': 'Front'},
+            {'name': 'Back'},
+        ],
         templates=[{'name': 'Dynamic Cloze Card', 'qfmt': qfmt, 'afmt': afmt}],
-        css=DYNAMIC_CLOZE_CSS
+        css=combined_css
     )
 
 
@@ -621,7 +631,11 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None,
     files = sorted(glob.glob(os.path.join(dest_dir, "*.jpg")))
     guid_map_data = load_guid_map_from_dir(work_dir)
     notes_meta = guid_map_data.get("notes", {})
-    effective_deck_name = deck_name.strip() or guid_map_data.get("deck_name", "Default_Deck")
+
+    # Ankiから復元された正確な deck_name がある場合はそれを最優先し、デッキ分裂を防ぐ
+    restored_deck = (guid_map_data.get("deck_name") or "").strip()
+    input_deck = (deck_name or "").strip()
+    effective_deck_name = restored_deck if (guid_map_data.get("is_restored_from_anki") and restored_deck) else (input_deck or restored_deck or "Default_Deck")
 
     if summary_cards is None:
         summary_cards = load_summary_cloze_from_dir(work_dir)
@@ -698,28 +712,32 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None,
                 media_list.extend([data['a'], data['b']])
                 slide_note_count += 1
 
-    # ② 要約圧縮ダイナミックClozeカード (Medical Dynamic Cloze Model) を後に追加
+    # ② 要約圧縮ダイナミックClozeカード (SortTitle / Front / Back) を後に追加
     if summary_cards:
         dc_model = get_dynamic_cloze_model()
         prefix_base = group_title.strip() if (group_title and group_title.strip()) else effective_deck_name.split("::")[-1].strip()
         for idx, card in enumerate(sorted(summary_cards, key=lambda c: c.get("chapter_idx", 999)), 1):
-            body_html = strip_embedded_style(card.get("html", ""))
-            if not body_html:
+            front_html = strip_embedded_style(card.get("html", ""))
+            if not front_html:
                 continue
             ch_idx = int(card.get("chapter_idx") or idx)
             raw_title = (card.get("title") or f"Chapter {ch_idx}").strip()
-            # すでにプレフィックスが付いている場合の二重付与を防止
             if prefix_base and not raw_title.startswith(prefix_base):
                 sort_title = f"{prefix_base} s.{ch_idx:02d} {raw_title}"
             else:
                 sort_title = raw_title
+
+            # Back フィールド: Cloze解除済みノート本体 ＋ あればLLM補足解説
+            back_ai = strip_embedded_style(card.get("back_extra", ""))
+            ai_block = f'<div class="ai-container">{back_ai}</div>' if back_ai else ""
+            back_html = f'<div class="back-view">{front_html}</div>{ai_block}'
 
             guid = card.get("guid") or genanki.guid_for(f"{effective_deck_name}_summary_ch{ch_idx:02d}")
             tags = card.get("tags", [])
 
             note = genanki.Note(
                 model=dc_model,
-                fields=[sort_title, body_html],
+                fields=[sort_title, front_html, back_html],
                 guid=guid,
                 tags=tags,
             )

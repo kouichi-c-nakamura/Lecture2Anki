@@ -287,6 +287,11 @@ DYNAMIC_CLOZE_CSS = """
   text-align: left;
   vertical-align: top;
 }
+.cbt-table th:first-child, .cbt-table td:first-child {
+  min-width: 7.5em;
+  width: 16%;
+  word-break: keep-all;
+}
 .cbt-table th {
   background-color: #f1f5f9;
   color: #334155;

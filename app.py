@@ -37,7 +37,10 @@ from storage import (
     identify_prompt_label,
     load_api_usage_stats,
 )
-from gemini_client import call_gemini_enhance
+from gemini_client import (
+    call_gemini_enhance,
+    call_gemini_summary_back_explanation,
+)
 from anki_io import (
     get_poppler_path,
     extract_pdf_pages,
@@ -1110,12 +1113,67 @@ with tab_ai_inspect:
 # タブ 3: ⚡ 要約圧縮ダイナミックCloze（Markdown / HTML 決定論的変換 ＆ <u>...</u> 特化）
 # ==============================================================================
 with tab_summary_cloze:
-    st.subheader("⚡ 要約圧縮ダイナミックCloze (Medical Dynamic Cloze Model)")
-    st.caption("Markdown または HTML で作成した要約テキストに対し、穴埋めしたい箇所を `<u>語句</u>` で囲んで貼り付けると、全チャプターを一括分割してダイナミックCloze化します（LaTeX数式とは衝突しません）。")
+    st.subheader("⚡ 要約圧縮ダイナミックCloze (Medical Dynamic Cloze Model 3F)")
+    st.caption("Markdown または HTML に `<u>語句</u>` を付けて貼り付けると、全チャプターを一括分割・Cloze化し、同時に裏面（Back）のAI補足解説も並列自動生成します。")
+
+    def _batch_generate_all_backs(cards_list, target_model_id, deck_title_label):
+        """全チャプターの Back 補足解説を並列API生成して保存する"""
+        total_c = len(cards_list)
+        pbar = st.progress(0)
+        status_txt = st.empty()
+        total_jpy = 0.0
+        errors = []
+        done = 0
+
+        def _job(idx_and_card):
+            i_pos, c_obj = idx_and_card
+            exp_html, u_rec = call_gemini_summary_back_explanation(
+                c_obj.get("html", ""),
+                api_key,
+                target_model_id,
+                deck_title=deck_title_label,
+            )
+            return i_pos, exp_html, u_rec
+
+        with ThreadPoolExecutor(max_workers=min(4, max(1, total_c))) as ex:
+            futures = {ex.submit(_job, (i, c)): i for i, c in enumerate(cards_list)}
+            for fut in as_completed(futures):
+                try:
+                    i_pos, exp_html, u_rec = fut.result()
+                    cards_list[i_pos]["back_extra"] = exp_html
+                    total_jpy += u_rec["cost_jpy"]
+                    ch_no = cards_list[i_pos].get("chapter_idx", i_pos + 1)
+                    st.session_state.pop(f"edit_sum_back_{ch_no}", None)
+                except Exception as exc:
+                    errors.append(str(exc))
+                done += 1
+                pbar.progress(done / total_c)
+                status_txt.text(f"Back解説を並列生成中 ({done}/{total_c} 完了) ｜ 累計実測: 約 {total_jpy:.2f} 円")
+
+        save_summary_cloze_to_dir(cards_list, active_work_dir)
+        return total_jpy, errors
 
     with st.container(border=True):
-        st.markdown("##### 📥 1. Markdown / HTML 一括貼り付け取り込み（`<u>語句</u>` ➔ 自動Cloze変換）")
-        st.caption("Markdown形式（`# 1. 章タイトル`、`## セクション`、`- 箇条書き`、`| 表 |`）でも、HTML形式でも自動判別して変換します。")
+        st.markdown("##### 📥 1. Markdown / HTML 一括貼り付け取り込み（`<u>語句</u>` ➔ Cloze化 ＋ Back解説自動生成）")
+
+        opt_c1, opt_c2 = st.columns([2.2, 1.8])
+        with opt_c1:
+            auto_gen_back = st.checkbox(
+                "✨ 取り込みと同時に全チャプターの Back 解説を並列API生成する",
+                value=bool(api_key),
+                disabled=not api_key,
+            )
+        with opt_c2:
+            model_labels_sc = list(PRICING_MODELS.keys())
+            def_sc_idx = next((i for i, lbl in enumerate(model_labels_sc) if "3.6 Flash" in lbl), 0)
+            sel_sc_label = st.selectbox(
+                "Back解説生成モデル",
+                model_labels_sc,
+                index=def_sc_idx,
+                key="sel_sc_back_model",
+                label_visibility="collapsed",
+            )
+            sc_back_model_id = PRICING_MODELS[sel_sc_label]["id"]
 
         bulk_col1, bulk_col2 = st.columns([4, 1])
         with bulk_col1:
@@ -1142,11 +1200,35 @@ with tab_summary_cloze:
                         for c in parsed_list:
                             st.session_state.pop(f"edit_sum_html_{c['chapter_idx']}", None)
                             st.session_state.pop(f"edit_sum_title_{c['chapter_idx']}", None)
+                            st.session_state.pop(f"edit_sum_back_{c['chapter_idx']}", None)
                         st.session_state.summary_idx = 0
-                        st.toast(f"✅ 全 {len(parsed_list)} チャプターを変換し、<u>...</u> をCloze化して登録しました！")
+
+                        if auto_gen_back and api_key:
+                            cost_jpy, errs = _batch_generate_all_backs(parsed_list, sc_back_model_id, deck_title_str)
+                            if errs:
+                                st.error("一部のBack解説生成でエラー: " + " / ".join(errs))
+                            else:
+                                st.toast(f"✅ 全 {len(parsed_list)} ChのCloze化＆Back解説生成が完了！（約 {cost_jpy:.2f} 円）")
+                        else:
+                            st.toast(f"✅ 全 {len(parsed_list)} チャプターを変換して登録しました！")
                         st.rerun()
                     else:
                         st.error("有効なチャプターデータを検出できませんでした。")
+
+            if summary_cards:
+                if st.button(
+                    f"🚀 既存全{len(summary_cards)}ChのBackを一括生成",
+                    disabled=not api_key,
+                    width="stretch",
+                    help="すでに登録済みの全チャプター（古い8枚など）に対してBack解説を一括生成します",
+                ):
+                    deck_title_str = st.session_state.get("group_title_val") or st.session_state.get("deck_name_val") or "講義要約"
+                    cost_jpy, errs = _batch_generate_all_backs(summary_cards, sc_back_model_id, deck_title_str)
+                    if errs:
+                        st.error("一部のBack解説生成でエラー: " + " / ".join(errs))
+                    else:
+                        st.toast(f"✅ 全 {len(summary_cards)} ChのBack解説を一括生成しました！（約 {cost_jpy:.2f} 円）")
+                    st.rerun()
 
             if st.button("➕ 空のChを1枚追加", width="stretch"):
                 next_ch = (max([c.get("chapter_idx", 0) for c in summary_cards]) + 1) if summary_cards else 1
@@ -1162,6 +1244,7 @@ with tab_summary_cloze:
                     "chapter_idx": next_ch,
                     "title": f"{next_ch}. 新規チャプター",
                     "html": convert_markers_to_cloze(template_initial),
+                    "back_extra": "",
                     "is_suspended": False,
                     "tags": [],
                 })
@@ -1228,6 +1311,14 @@ with tab_summary_cloze:
                 st.session_state.summary_idx += 1
                 st.rerun()
 
+        # Front ＆ Back 補足解説プレビュー
+        back_extra_val = cur_card.get("back_extra", "")
+        back_ai_preview = (
+            f'<hr style="margin:16px 0; border:none; border-top:2px dashed #cbd5e1;">'
+            f'<div class="ai-container">{back_extra_val}</div>'
+            if back_extra_val.strip() else ""
+        )
+
         preview_dc_html = f"""
         <style>
             html, body {{
@@ -1236,16 +1327,22 @@ with tab_summary_cloze:
                 background: #e2e8f0;
             }}
             {DYNAMIC_CLOZE_CSS}
+            .ai-container {{ margin-top: 12px; text-align: left; background: #fff; border-radius: 8px; padding: 14px; border: 1px solid #cbd5e1; font-size: 0.95em; line-height: 1.6; color: #1e293b; }}
+            .ai-title {{ background: #0b4f8c; color: #fff; font-size: 1.05em; font-weight: bold; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }}
+            .ai-summary-box {{ background: #fff4f4; border-left: 4px solid #ff3b30; padding: 8px 12px; margin-bottom: 12px; border-radius: 0 4px 4px 0; }}
+            .ai-summary-title {{ color: #d70015; font-weight: bold; margin-bottom: 2px; }}
+            .ai-cascade-box {{ background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px; padding: 10px 14px; margin-top: 10px; }}
         </style>
         <div class="card" id="dc-preview-root" style="border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <span style="font-size:11px; color:#64748b;">💡 黄色いCloze箇所にホバーまたはクリックで解答表示（右ボタンで全開切替）</span>
+                <span style="font-size:11px; color:#64748b;">💡 黄色いCloze箇所にホバーまたはクリックで解答表示（右ボタンでBack面・全解答切替）</span>
                 <button type="button" onclick="document.getElementById('dc-preview-root').classList.toggle('back-view');" 
                         style="font-size:11px; padding:3px 10px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1e293b; cursor:pointer; font-weight:600;">
-                    👁️ 全表示 / 隠す (Back面確認)
+                    👁️ Front / Back(全解答) 切替
                 </button>
             </div>
             {cur_card.get("html", "")}
+            {back_ai_preview}
         </div>
         <script>
             document.querySelectorAll('#dc-preview-root .cloze-container').forEach(function(el) {{
@@ -1255,36 +1352,66 @@ with tab_summary_cloze:
             }});
         </script>
         """
-        st.components.v1.html(preview_dc_html, height=520, scrolling=True)
+        st.components.v1.html(preview_dc_html, height=560 if back_extra_val.strip() else 480, scrolling=True)
 
+        # Front / Back 編集コンテナ
         title_key = f"edit_sum_title_{cur_ch_idx}"
         html_key = f"edit_sum_html_{cur_ch_idx}"
+        back_key = f"edit_sum_back_{cur_ch_idx}"
         if title_key not in st.session_state:
             st.session_state[title_key] = cur_card.get("title", f"Chapter {cur_ch_idx}")
         if html_key not in st.session_state:
             st.session_state[html_key] = cur_card.get("html", "")
+        if back_key not in st.session_state:
+            st.session_state[back_key] = cur_card.get("back_extra", "")
 
         with st.container(border=True):
             ed_c1, ed_c2 = st.columns([4, 1])
             with ed_c1:
-                new_title_val = st.text_input("Chapterタイトル (ChapterTitleフィールド)", key=title_key)
+                new_title_val = st.text_input("Chapterタイトル (SortTitle用)", key=title_key)
                 new_html_val = st.text_area(
-                    "BodyHTML ソースコード（追加で <u>語句</u> と囲んで保存すると自動でClozeタグに変換されます）",
+                    "Front HTML（追加で <u>語句</u> と囲んで保存すると自動でClozeタグに変換されます）",
                     key=html_key,
-                    height=240,
+                    height=200,
+                )
+                new_back_val = st.text_area(
+                    "Back 補足解説 HTML（Cloze解除済みノートの直下に表示されるLLM解説欄・空欄可）",
+                    key=back_key,
+                    height=140,
                 )
             with ed_c2:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
                 if st.button("💾 このChを保存", type="primary", width="stretch"):
-                    cleaned = convert_markers_to_cloze(strip_embedded_style(new_html_val))
+                    cleaned_front = convert_markers_to_cloze(strip_embedded_style(new_html_val))
+                    cleaned_back = strip_embedded_style(new_back_val)
                     cur_card["title"] = new_title_val.strip() or f"Chapter {cur_ch_idx}"
-                    cur_card["html"] = cleaned
+                    cur_card["html"] = cleaned_front
+                    cur_card["back_extra"] = cleaned_back
                     save_summary_cloze_to_dir(summary_cards, active_work_dir)
                     st.session_state.pop(html_key, None)
+                    st.session_state.pop(back_key, None)
                     st.toast(f"✅ Chapter {cur_ch_idx} を保存しました！")
                     st.rerun()
 
-                render_clipboard_button(cur_card.get("html", ""), label="📋 HTMLコピー")
+                if st.button("✨ Back補足解説を生成", disabled=not api_key, width="stretch", help="現在のFrontノートから裏面用の補足解説をGemini APIで生成します"):
+                    with st.spinner("裏面用の補足解説を生成中..."):
+                        try:
+                            deck_title_str = st.session_state.get("group_title_val") or st.session_state.get("deck_name_val") or "講義要約"
+                            exp_html, u_rec = call_gemini_summary_back_explanation(
+                                cur_card.get("html", ""),
+                                api_key,
+                                "gemini-3.6-flash",
+                                deck_title=deck_title_str,
+                            )
+                            cur_card["back_extra"] = exp_html
+                            save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                            st.session_state.pop(back_key, None)
+                            st.toast(f"✅ Back補足解説を生成しました！（約 {u_rec['cost_jpy']:.2f} 円）")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"生成エラー: {e}")
+
+                render_clipboard_button(cur_card.get("html", ""), label="📋 Frontコピー")
 
                 if st.button("🗑️ このChを削除", width="stretch"):
                     summary_cards.pop(st.session_state.summary_idx)
@@ -1326,6 +1453,17 @@ with tab_build:
     st.info(f"📁 出力先フォルダ（および3つのJSON保存先）: `{display_dir}`")
 
     gm_full = load_guid_map_from_dir(active_work_dir)
+    restored_deck_name = (gm_full.get("deck_name") or "").strip()
+    input_deck_name = st.session_state.get("deck_name_val", "").strip()
+    deck_full_name = restored_deck_name if (gm_full.get("is_restored_from_anki") and restored_deck_name) else input_deck_name
+
+    if restored_deck_name and input_deck_name and restored_deck_name != input_deck_name:
+        st.warning(
+            f"⚠️ サイドバーのDeck名 (`{input_deck_name}`) とAnki復元元のDeck名 (`{restored_deck_name}`) が異なります。"
+            f"デッキ分裂を防ぐため、出力先には **`{restored_deck_name}`** を自動採用します。"
+        )
+    st.write(f"出力先デッキ名: **{deck_full_name}**")
+    
     is_restored_deck = gm_full.get("is_restored_from_anki", False)
     gm_notes = gm_full.get("notes", {})
 
