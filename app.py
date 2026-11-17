@@ -16,14 +16,13 @@ from config import (
     DEFAULT_PROMPT,
     SVG_OVERLAY_PROMPT,
     DYNAMIC_CLOZE_CSS,
-    WEB_LLM_REDLINE_COPY_PROMPT,
+    WEB_LLM_MARKDOWN_PROMPT,
 )
 from storage import (
     get_last_folder,
     save_last_folder,
     infer_unmasked_from_masked,
     auto_detect_pdfs,
-    auto_detect_summary_pdf,
     load_folder_config,
     save_folder_config,
     load_guid_map_from_dir,
@@ -38,10 +37,7 @@ from storage import (
     identify_prompt_label,
     load_api_usage_stats,
 )
-from gemini_client import (
-    call_gemini_enhance,
-    call_gemini_redline_pdf_to_cloze,
-)
+from gemini_client import call_gemini_enhance
 from anki_io import (
     get_poppler_path,
     extract_pdf_pages,
@@ -49,8 +45,8 @@ from anki_io import (
     build_apkg,
     strip_embedded_style,
     renumber_cloze_spans,
-    convert_brackets_to_cloze,
-    parse_bulk_summary_html,
+    convert_markers_to_cloze,
+    parse_bulk_summary_input,
 )
 from ui_helpers import (
     copy_image_to_clipboard_macos,
@@ -98,7 +94,6 @@ def apply_folder_to_state(folder_path, explicit_masked=None, explicit_unmasked=N
     safe_set_state("base_folder_val", folder_path)
     cfg = load_folder_config(folder_path)
     u_default, m_default = auto_detect_pdfs(folder_path)
-    s_default = auto_detect_summary_pdf(folder_path)
 
     d_name = cfg.get("deck_name", "")
     g_title = cfg.get("group_title", "")
@@ -121,7 +116,6 @@ def apply_folder_to_state(folder_path, explicit_masked=None, explicit_unmasked=N
     safe_set_state("pdf_pass_val", cfg.get("password", ""))
     safe_set_state("masked_pdf_val", final_masked)
     safe_set_state("unmasked_pdf_val", final_unmasked)
-    safe_set_state("summary_pdf_val", cfg.get("summary_pdf") or s_default)
     save_last_folder(folder_path)
 
 
@@ -148,7 +142,6 @@ if "base_folder_val" not in st.session_state:
         st.session_state.pdf_pass_val = ""
         st.session_state.unmasked_pdf_val = ""
         st.session_state.masked_pdf_val = ""
-        st.session_state.summary_pdf_val = ""
 
 
 def on_deck_naming_change():
@@ -258,7 +251,6 @@ with st.sidebar:
                 "base_folder": bf_target,
                 "unmasked_pdf": st.session_state.get("unmasked_pdf_val", ""),
                 "masked_pdf": st.session_state.get("masked_pdf_val", ""),
-                "summary_pdf": st.session_state.get("summary_pdf_val", ""),
             }
             save_folder_config(bf_target, cfg_data)
             st.toast(f"✅ フォルダ内に {FOLDER_CONFIG_FILENAME} を保存しました")
@@ -277,7 +269,7 @@ with st.sidebar:
     if u_stats["recent"]:
         with st.expander("直近の実測トークン履歴 (最新10件)", expanded=False):
             for r in u_stats["recent"]:
-                mode_tag = "🖍️赤線Cloze" if str(r.get("image", "")).startswith("REDLINE_PDF") else ("🎯SVG" if r.get("is_svg") else "標準")
+                mode_tag = "🎯SVG" if r.get("is_svg") else "標準"
                 st.markdown(
                     f"<div style='font-size:11px; border-bottom:1px solid #334155; padding:4px 0;'>"
                     f"<b>{r['image']}</b> ({mode_tag})<br>"
@@ -441,7 +433,6 @@ with tab_extract:
                             "base_folder": bf_cur,
                             "unmasked_pdf": unmasked_pdf,
                             "masked_pdf": st.session_state.get("masked_pdf_val", ""),
-                            "summary_pdf": st.session_state.get("summary_pdf_val", ""),
                         })
                     ts, cnt = extract_pdf_pages(
                         unmasked_pdf,
@@ -1116,36 +1107,33 @@ with tab_ai_inspect:
 
 
 # ==============================================================================
-# タブ 3: ⚡ 要約圧縮ダイナミックCloze（赤線PDF変換 ＆ Web LLM一括貼り付け特化）
+# タブ 3: ⚡ 要約圧縮ダイナミックCloze（Markdown / HTML 決定論的変換 ＆ <u>...</u> 特化）
 # ==============================================================================
 with tab_summary_cloze:
     st.subheader("⚡ 要約圧縮ダイナミックCloze (Medical Dynamic Cloze Model)")
-    st.caption("赤線を引いたまとめPDFからの変換、またはWeb LLMで出力した全チャプターHTML（[[...]]形式）の一括貼り付けで、タップ開閉式のClozeカードを作成します。")
+    st.caption("Markdown または HTML で作成した要約テキストに対し、穴埋めしたい箇所を `<u>語句</u>` で囲んで貼り付けると、全チャプターを一括分割してダイナミックCloze化します（LaTeX数式とは衝突しません）。")
 
-    # --------------------------------------------------------------------------
-    # 1A. Web LLM 出力の全チャプター一括貼り付け取り込み（メイン・最速ルート）
-    # --------------------------------------------------------------------------
     with st.container(border=True):
-        st.markdown("##### 📥 1A. Web LLM 出力HTMLの丸ごと一括貼り付け取り込み（おすすめ・APIコスト0円）")
-        st.caption("定額制の LLM Chat（Gemini / Claude / ChatGPT）に赤線PDFを渡して出力させた全チャプター分の HTML を、ここにまとめて貼り付けてください。`<div class=\"meta-header\">` で自動分割し、`[[...]]` を赤番号Clozeへ一括変換します。")
+        st.markdown("##### 📥 1. Markdown / HTML 一括貼り付け取り込み（`<u>語句</u>` ➔ 自動Cloze変換）")
+        st.caption("Markdown形式（`# 1. 章タイトル`、`## セクション`、`- 箇条書き`、`| 表 |`）でも、HTML形式でも自動判別して変換します。")
 
         bulk_col1, bulk_col2 = st.columns([4, 1])
         with bulk_col1:
-            bulk_html_input = st.text_area(
-                "全チャプター分の [[...]] 付きHTMLをここにペースト",
-                key="bulk_summary_html_input",
-                height=160,
-                placeholder='<div class="meta-header">呼吸器病治療薬まとめ（Chapter 1 / 8）</div>\n<div class="question-box">1. 気管支平滑筋の収縮と弛緩</div>\n...',
+            bulk_text_input = st.text_area(
+                "Markdown または HTML をここにペースト",
+                key="bulk_summary_text_input",
+                height=190,
+                placeholder="# 1. 気管支平滑筋の収縮と弛緩\n\n> **気道の防御機構：** 肺でのガス交換を維持するため...\n\n| 状態 | 主な刺激・受容体 | 細胞内シグナル |\n| :--- | :--- | :--- |\n| 気管支収縮 | ACh（<u>M<sub>3</sub>受容体</u>） | <u>G<sub>q</sub></u>活性化 → <u>PLC</u>活性化 |",
                 label_visibility="collapsed",
             )
         with bulk_col2:
             if st.button("📥 一括分割して取り込む", type="primary", width="stretch"):
-                if not bulk_html_input.strip():
-                    st.warning("HTMLテキストを貼り付けてください。")
+                if not bulk_text_input.strip():
+                    st.warning("Markdown または HTML テキストを貼り付けてください。")
                 else:
                     deck_title_str = st.session_state.get("group_title_val") or st.session_state.get("deck_name_val") or "講義要約"
-                    parsed_list = parse_bulk_summary_html(
-                        bulk_html_input,
+                    parsed_list = parse_bulk_summary_input(
+                        bulk_text_input,
                         deck_title=deck_title_str,
                         existing_cards=summary_cards,
                     )
@@ -1155,10 +1143,10 @@ with tab_summary_cloze:
                             st.session_state.pop(f"edit_sum_html_{c['chapter_idx']}", None)
                             st.session_state.pop(f"edit_sum_title_{c['chapter_idx']}", None)
                         st.session_state.summary_idx = 0
-                        st.toast(f"✅ 全 {len(parsed_list)} チャプターを一括分割し、[[...]] をCloze化して登録しました！")
+                        st.toast(f"✅ 全 {len(parsed_list)} チャプターを変換し、<u>...</u> をCloze化して登録しました！")
                         st.rerun()
                     else:
-                        st.error("有効なチャプターHTMLを検出できませんでした。")
+                        st.error("有効なチャプターデータを検出できませんでした。")
 
             if st.button("➕ 空のChを1枚追加", width="stretch"):
                 next_ch = (max([c.get("chapter_idx", 0) for c in summary_cards]) + 1) if summary_cards else 1
@@ -1167,13 +1155,13 @@ with tab_summary_cloze:
                 template_initial = (
                     f'<div class="meta-header">{deck_title_str}（Chapter {next_ch}）</div>\n'
                     f'<div class="question-box">{next_ch}. 新規チャプタータイトル</div>\n'
-                    f'<div class="feature-box"><b>要点：</b>ここに解説と [[重要語句]] を記述してください。</div>'
+                    f'<div class="feature-box"><b>要点：</b>ここに解説と <u>重要語句</u> を記述してください。</div>'
                 )
                 summary_cards.append({
                     "guid": new_guid,
                     "chapter_idx": next_ch,
                     "title": f"{next_ch}. 新規チャプター",
-                    "html": convert_brackets_to_cloze(template_initial),
+                    "html": convert_markers_to_cloze(template_initial),
                     "is_suspended": False,
                     "tags": [],
                 })
@@ -1182,62 +1170,7 @@ with tab_summary_cloze:
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # 1B. 赤線マーキング済みまとめPDFからの直接変換（Gemini APIルート）
-    # --------------------------------------------------------------------------
-    with st.expander("🖍️ 1B. 赤線マーキング済み「まとめPDF」を直接APIでCloze化する", expanded=False):
-        sp_c1, sp_c2 = st.columns([5, 1])
-        with sp_c2:
-            if st.button("📄 PDF選択", key="btn_choose_sum_pdf", width="stretch"):
-                chosen_sp = choose_file_dialog("赤線マーキング済みまとめPDFを選択", default_dir=st.session_state.get("base_folder_val"))
-                if chosen_sp:
-                    safe_set_state("summary_pdf_val", chosen_sp)
-                    st.rerun()
-        with sp_c1:
-            sum_pdf_path = st.text_input(
-                "まとめPDFパス",
-                value=st.session_state.get("summary_pdf_val", ""),
-                key="summary_pdf_val",
-                placeholder="/path/to/2026-11-17_呼吸器病治療薬_まとめ.pdf",
-                label_visibility="collapsed",
-            )
-
-        sp_m1, sp_m2 = st.columns([2, 1])
-        with sp_m1:
-            model_labels_sc = list(PRICING_MODELS.keys())
-            def_sc_idx = next((i for i, label in enumerate(model_labels_sc) if "3.8 Flash" in label or "3.6 Flash" in label), 0)
-            sel_sc_model_label = st.selectbox("使用モデル（赤線認識精度重視）", model_labels_sc, index=def_sc_idx, key="sel_sc_model")
-            sc_model_id = PRICING_MODELS[sel_sc_model_label]["id"]
-        with sp_m2:
-            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if st.button(
-                "🖍️ 赤線PDFから一括Cloze生成",
-                type="primary",
-                disabled=(not sum_pdf_path or not os.path.exists(sum_pdf_path) or not api_key),
-                width="stretch",
-            ):
-                with st.spinner("赤線マーキング済みPDFを読み取り、Clozeカードへ変換中..."):
-                    try:
-                        deck_title_str = st.session_state.get("group_title_val") or st.session_state.get("deck_name_val") or "講義要約"
-                        new_cards, u_rec = call_gemini_redline_pdf_to_cloze(
-                            summary_pdf_path=sum_pdf_path,
-                            api_key=api_key,
-                            model_id=sc_model_id,
-                            deck_title=deck_title_str,
-                            password=pdf_pass,
-                            existing_cards=summary_cards,
-                        )
-                        save_summary_cloze_to_dir(new_cards, active_work_dir)
-                        for c in new_cards:
-                            st.session_state.pop(f"edit_sum_html_{c['chapter_idx']}", None)
-                            st.session_state.pop(f"edit_sum_title_{c['chapter_idx']}", None)
-                        st.session_state.summary_idx = 0
-                        st.toast(f"✅ 赤線PDFから {len(new_cards)} 枚のClozeカードを生成しました！（実測: 約 {u_rec['cost_jpy']:.2f} 円）")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"赤線PDF変換中にエラーが発生しました: {e}")
-
-    # --------------------------------------------------------------------------
-    # 2. 生成・登録済み要約Clozeカードのプレビュー＆個別編集セクション
+    # 2. 登録済み要約Clozeカードのプレビュー＆個別編集セクション
     # --------------------------------------------------------------------------
     st.markdown("---")
     if summary_cards:
@@ -1336,14 +1269,14 @@ with tab_summary_cloze:
             with ed_c1:
                 new_title_val = st.text_input("Chapterタイトル (ChapterTitleフィールド)", key=title_key)
                 new_html_val = st.text_area(
-                    "BodyHTML ソースコード（新しく [[語句]] と囲んで保存すると自動でClozeタグに変換されます）",
+                    "BodyHTML ソースコード（追加で <u>語句</u> と囲んで保存すると自動でClozeタグに変換されます）",
                     key=html_key,
                     height=240,
                 )
             with ed_c2:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
                 if st.button("💾 このChを保存", type="primary", width="stretch"):
-                    cleaned = convert_brackets_to_cloze(strip_embedded_style(new_html_val))
+                    cleaned = convert_markers_to_cloze(strip_embedded_style(new_html_val))
                     cur_card["title"] = new_title_val.strip() or f"Chapter {cur_ch_idx}"
                     cur_card["html"] = cleaned
                     save_summary_cloze_to_dir(summary_cards, active_work_dir)
@@ -1359,21 +1292,21 @@ with tab_summary_cloze:
                     st.session_state.summary_idx = max(0, st.session_state.summary_idx - 1)
                     st.rerun()
     else:
-        st.info("まだ要約圧縮ダイナミックClozeカードがありません。上の「1A」にWeb LLMの出力HTMLを貼り付けるか、「1B」で赤線PDFから生成してください。")
+        st.info("まだ要約圧縮ダイナミックClozeカードがありません。上の「1」に Markdown または HTML を貼り付けて取り込んでください。")
 
     # --------------------------------------------------------------------------
-    # 3. 最下部：外部LLM App で赤線PDFを変換させるためのプロンプトコピー欄
+    # 3. 最下部：Web LLM Chat で高粒度Markdownまとめを作成させるプロンプトコピー欄
     # --------------------------------------------------------------------------
     st.markdown("---")
-    st.markdown("#### 📋 3. 外部LLM App（定額制Webチャット等）に赤線PDFを渡すためのプロンプト")
-    st.caption("赤線を引いたまとめPDFを Web版 Gemini / Claude / ChatGPT に添付し、以下のプロンプトをコピーして送信すると、上の「1A」にそのまま貼り付けられるHTMLが出力されます。")
+    st.markdown("#### 📋 3. Web LLM Chat で高粒度Markdownまとめを作成するためのプロンプト")
+    st.caption("定額制の LLM Chat に講義PDFを渡し、以下のプロンプトで粒度を落とさないMarkdownを作成させてから、好きなエディタで `Cmd+U`（`<u>...</u>`）を付けて上の「1」に貼り付けてください。")
 
     pr_col1, pr_col2 = st.columns([4, 1])
     with pr_col1:
-        st.code(WEB_LLM_REDLINE_COPY_PROMPT, language="text")
+        st.code(WEB_LLM_MARKDOWN_PROMPT, language="text")
     with pr_col2:
         st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
-        render_clipboard_button(WEB_LLM_REDLINE_COPY_PROMPT, label="📋 プロンプトをコピー")
+        render_clipboard_button(WEB_LLM_MARKDOWN_PROMPT, label="📋 プロンプトをコピー")
         with st.expander("🎨 内蔵CSSを確認", expanded=False):
             st.code(DYNAMIC_CLOZE_CSS, language="css")
 
