@@ -9,6 +9,7 @@ import zlib
 from datetime import datetime
 from PIL import Image
 import genanki
+from bs4 import BeautifulSoup
 from pdf2image import convert_from_path, pdfinfo_from_path
 from config import (
     DEST_DIR,
@@ -116,273 +117,246 @@ def get_dynamic_cloze_model():
 # HTMLクリーニング・<u> / [...] Cloze変換・Markdown決定論的HTML変換パーサー
 # ==============================================================================
 def strip_embedded_style(html_str):
-    s = (html_str or "").strip()
-    if s.startswith("```html"):
-        s = s[7:]
-    elif s.startswith("```markdown"):
-        s = s[11:]
-    elif s.startswith("```md"):
-        s = s[5:]
-    elif s.startswith("```"):
-        s = s[3:]
-    if s.endswith("```"):
-        s = s[:-3]
-    s = re.sub(r'<style[^>]*>.*?</style>', '', s, flags=re.DOTALL | re.IGNORECASE).strip()
-    m_card = re.match(r'^<div\s+class=["\']card["\'][^>]*>(.*)</div>\s*$', s, flags=re.DOTALL | re.IGNORECASE)
-    if m_card:
-        inner = m_card.group(1).strip()
-        if not re.search(r'<div\s+class=["\']card["\']', inner, flags=re.IGNORECASE):
-            s = inner
-    return s
+    """HTML文字列に埋め込まれた <style>...</style> タグを除去する"""
+    if not html_str:
+        return ""
+    return re.sub(r'<style[^>]*>.*?</style>', '', html_str, flags=re.DOTALL | re.IGNORECASE).strip()
 
 
 def renumber_cloze_spans(html_str):
-    counter = [0]
+    """
+    <span class="cloze-container"><span class="cloze-num">N.</span>...</span>
+    の番号を、出現順に 1. から連番で振り直す。
+    """
+    counter = 0
 
-    def _repl(m):
-        counter[0] += 1
-        return f'{m.group(1)}{counter[0]}.{m.group(2)}'
+    def _repl(match):
+        nonlocal counter
+        counter += 1
+        return f'{match.group(1)}{counter}.{match.group(2)}'
 
-    return re.sub(
-        r'(<span\s+class=["\']cloze-num["\'][^>]*>)\s*\d+\.?\s*(</span>)',
-        _repl,
-        html_str,
-        flags=re.IGNORECASE,
+    pattern = re.compile(
+        r'(<span\s+class=["\']cloze-container["\']>\s*<span\s+class=["\']cloze-num["\']>)\s*\d+\.?\s*(</span>)',
+        re.IGNORECASE,
     )
+    return pattern.sub(_repl, html_str)
+
+
+def normalize_crossed_underline_and_bold(text):
+    """
+    エディタの Cmd+U 等で生じた `**<u>...**</u>` や `<u>**...</u>**` のタグ交差を正規化し、
+    `<u>...</u>` 内の `**...**` を先に <b>...</b> に展開してから、外側の `**...**` を変換する。
+    """
+    text = re.sub(r'\*\*<u>(.*?)\*\*</u>', r'<u><b>\1</b></u>', text, flags=re.DOTALL)
+    text = re.sub(r'<u>\*\*(.*?)</u>\*\*', r'<u><b>\1</b></u>', text, flags=re.DOTALL)
+
+    def _bold_inside_u(m):
+        inner = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', m.group(1), flags=re.DOTALL)
+        return f'<u>{inner}</u>'
+
+    text = re.sub(r'<u>(.*?)</u>', _bold_inside_u, text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'\*\*((?:(?!<u>|</u>).)+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
+    return text
+
+
+def repair_html_tree(html_str):
+    """
+    BeautifulSoup (html.parser) を通して未閉鎖タグ・タグ交差・孤立閉じタグをDOMレベルで自動修復し、
+    クリーンなHTML文字列として返す。
+    """
+    soup = BeautifulSoup(html_str, "html.parser")
+    if soup.body:
+        return "".join(str(c) for c in soup.body.contents)
+    return str(soup)
 
 
 def convert_markers_to_cloze(html_str):
     """
-    <u>語句</u> のみを
-    <span class="cloze-container"><span class="cloze-num">N.</span><span class="cloze-hint">語句</span></span>
-    に変換し、1. から連番を振る（LaTeXの \\[...\\] や [...] には一切干渉しない）。
+    1. ** と <u> の交差を正規化
+    2. <u>語句</u> を <span class="cloze-container">...</span> に変換（LaTeX [...] には干渉しない）
+    3. BeautifulSoup でHTML階層構造を完全修復
+    4. 1. から連番を振る
     """
+    s = normalize_crossed_underline_and_bold(html_str)
     s = re.sub(
         r'<u>(.*?)</u>',
         r'<span class="cloze-container"><span class="cloze-num">1.</span><span class="cloze-hint">\1</span></span>',
-        html_str,
+        s,
         flags=re.DOTALL | re.IGNORECASE,
     )
+    s = repair_html_tree(s)
     return renumber_cloze_spans(s)
 
 
-def _inline_md_to_html(text):
-    """インラインMarkdown（**太字**）を <b> に変換"""
-    return re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+def _markdown_chapter_to_html(md_body, deck_title, ch_idx, ch_title):
+    """1チャプター分のMarkdownテキストを、タグ交差やテーブル崩れなくクリーンなHTMLに変換する"""
+    u_tokens = []
 
+    def _stash_u(m):
+        inner = m.group(1)
+        inner = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', inner, flags=re.DOTALL)
+        token = f"@@CLOZE_U_{len(u_tokens)}@@"
+        u_tokens.append(f"<u>{inner}</u>")
+        return token
 
-def markdown_chapter_to_html(md_chunk, deck_title, ch_idx, total_chapters):
-    """
-    1チャプター分の Markdown テキストを、決定論的に
-    meta-header / question-box / feature-box / point-blocks / cbt-table 構造の HTML に変換する。
-    """
-    lines = md_chunk.strip().splitlines()
-    title_text = f"Chapter {ch_idx}"
-    body_lines = []
+    s = re.sub(r'\*\*<u>(.*?)\*\*</u>', r'<u><b>\1</b></u>', md_body, flags=re.DOTALL)
+    s = re.sub(r'<u>\*\*(.*?)</u>\*\*', r'<u><b>\1</b></u>', s, flags=re.DOTALL)
+    s = re.sub(r'<u>(.*?)</u>', _stash_u, s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', s, flags=re.DOTALL)
 
-    for i, line in enumerate(lines):
-        m_h1 = re.match(r'^#\s+(.+)$', line.strip())
-        if m_h1:
-            title_text = _inline_md_to_html(m_h1.group(1).strip())
-            body_lines = lines[i + 1:]
-            break
-    else:
-        body_lines = lines
-
+    lines = s.splitlines()
     html_parts = [
-        f'<div class="meta-header">{deck_title}（Chapter {ch_idx} / {total_chapters}）</div>',
-        f'<div class="question-box">{title_text}</div>',
+        f'<div class="meta-header">{deck_title}（Chapter {ch_idx}）</div>',
+        f'<div class="question-box">{ch_title}</div>',
     ]
 
-    in_point_blocks = False
-    in_point_body = False
-    in_ul = False
-    table_buffer = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
 
-    def _close_ul():
-        nonlocal in_ul
-        if in_ul:
-            html_parts.append("</ul>")
-            in_ul = False
+        # 引用ブロック (> ...) -> feature-box
+        if line.startswith(">"):
+            quote_lines = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                quote_lines.append(re.sub(r'^>\s*', '', lines[i].strip()))
+                i += 1
+            html_parts.append(f'<div class="feature-box">{"<br>".join(quote_lines)}</div>')
+            continue
 
-    def _close_point_block():
-        nonlocal in_point_body
-        _close_ul()
-        if in_point_body:
+        # レベル2見出し (## ...) -> point-box
+        if line.startswith("## "):
+            sec_title = line[3:].strip()
+            html_parts.append(f'<div class="point-box"><div class="point-title">{sec_title}</div><div class="point-body">')
+            i += 1
+            while i < len(lines):
+                nxt = lines[i].strip()
+                if nxt.startswith("## ") or nxt.startswith("|") or nxt.startswith(">"):
+                    break
+                if not nxt:
+                    i += 1
+                    continue
+                if nxt.startswith("- ") or nxt.startswith("* "):
+                    ul_items = []
+                    while i < len(lines) and (lines[i].strip().startswith("- ") or lines[i].strip().startswith("* ")):
+                        ul_items.append(f"<li>{lines[i].strip()[2:].strip()}</li>")
+                        i += 1
+                    html_parts.append(f"<ul>{''.join(ul_items)}</ul>")
+                else:
+                    html_parts.append(f"<p>{nxt}</p>")
+                    i += 1
             html_parts.append("</div></div>")
-            in_point_body = False
-
-    def _close_point_blocks():
-        nonlocal in_point_blocks
-        _close_point_block()
-        if in_point_blocks:
-            html_parts.append("</div>")
-            in_point_blocks = False
-
-    def _flush_table():
-        nonlocal table_buffer
-        if not table_buffer:
-            return
-        rows = []
-        for raw_r in table_buffer:
-            cells = [c.strip() for c in raw_r.strip().strip("|").split("|")]
-            # 区切り行 (| :--- | :---: |) をスキップ
-            if all(re.fullmatch(r':?-{2,}:?', c) for c in cells if c):
-                continue
-            rows.append(cells)
-        table_buffer = []
-        if not rows:
-            return
-
-        _close_point_blocks()
-        t_html = ['<table class="cbt-table"><thead><tr>']
-        for h_cell in rows[0]:
-            t_html.append(f"<th>{_inline_md_to_html(h_cell)}</th>")
-        t_html.append("</tr></thead><tbody>")
-        for r_cells in rows[1:]:
-            t_html.append("<tr>")
-            for c_val in r_cells:
-                cell_html = _inline_md_to_html(c_val).replace(" / ", "<br>")
-                t_html.append(f"<td>{cell_html}</td>")
-            t_html.append("</tr>")
-        t_html.append("</tbody></table>")
-        html_parts.append("".join(t_html))
-
-    for raw_line in body_lines:
-        s_line = raw_line.strip()
-
-        # テーブル行の蓄積
-        if s_line.startswith("|") and "|" in s_line[1:]:
-            table_buffer.append(s_line)
-            continue
-        else:
-            _flush_table()
-
-        if not s_line:
             continue
 
-        # レベル2/3見出し (## / ###) -> .point-block
-        m_h2 = re.match(r'^#{2,3}\s+(.+)$', s_line)
-        if m_h2:
-            _close_point_block()
-            if not in_point_blocks:
-                html_parts.append('<div class="point-blocks">')
-                in_point_blocks = True
-            sec_title = _inline_md_to_html(m_h2.group(1).strip())
-            html_parts.append(f'<div class="point-block"><div class="point-title">{sec_title}</div><div class="point-body">')
-            in_point_body = True
+        # Markdownテーブル (| ... |)
+        if line.startswith("|") and "|" in line[1:]:
+            tbl_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                tbl_lines.append(lines[i].strip())
+                i += 1
+            if len(tbl_lines) >= 2:
+                headers = [c.strip() for c in tbl_lines[0].strip("|").split("|")]
+                start_row = 2 if re.match(r'^[\|\s:\-]+$', tbl_lines[1]) else 1
+                thead = "<thead><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr></thead>"
+                tbody_rows = []
+                for r_line in tbl_lines[start_row:]:
+                    cells = [c.strip() for c in r_line.strip("|").split("|")]
+                    while len(cells) < len(headers):
+                        cells.append("")
+                    tbody_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells[:len(headers)]) + "</tr>")
+                html_parts.append(f'<table class="cbt-table">{thead}<tbody>{"".join(tbody_rows)}</tbody></table>')
             continue
 
-        # 引用行 (> ...) -> .feature-box
-        if s_line.startswith(">"):
-            _close_point_blocks()
-            q_content = _inline_md_to_html(s_line.lstrip(">").strip())
-            html_parts.append(f'<div class="feature-box">{q_content}</div>')
+        # 通常の箇条書き (- / *)
+        if line.startswith("- ") or line.startswith("* "):
+            ul_items = []
+            while i < len(lines) and (lines[i].strip().startswith("- ") or lines[i].strip().startswith("* ")):
+                ul_items.append(f"<li>{lines[i].strip()[2:].strip()}</li>")
+                i += 1
+            html_parts.append(f'<div class="point-box"><div class="point-body"><ul>{"".join(ul_items)}</ul></div></div>')
             continue
 
-        # 箇条書き (- / * / 1.)
-        m_li = re.match(r'^(?:[-*+]|\d+\.)\s+(.+)$', s_line)
-        if m_li:
-            if not in_point_blocks:
-                html_parts.append('<div class="point-blocks">')
-                in_point_blocks = True
-            if not in_point_body:
-                html_parts.append('<div class="point-block"><div class="point-body">')
-                in_point_body = True
-            if not in_ul:
-                html_parts.append("<ul>")
-                in_ul = True
-            li_content = _inline_md_to_html(m_li.group(1).strip())
-            html_parts.append(f"<li>{li_content}</li>")
-            continue
+        # 通常段落
+        html_parts.append(f'<div class="feature-box">{line}</div>')
+        i += 1
 
-        # 通常の段落行
-        if in_point_body:
-            _close_ul()
-            html_parts.append(f"<p style='margin:4px 0;'>{_inline_md_to_html(s_line)}</p>")
-        else:
-            html_parts.append(f'<div class="feature-box">{_inline_md_to_html(s_line)}</div>')
+    raw_html = "\n".join(html_parts)
+    for idx_tok, orig_u in enumerate(u_tokens):
+        raw_html = raw_html.replace(f"@@CLOZE_U_{idx_tok}@@", orig_u)
 
-    _flush_table()
-    _close_point_blocks()
-
-    plain_title = re.sub(r'<[^>]+>', '', title_text).strip()
-    return plain_title, "\n".join(html_parts)
+    return convert_markers_to_cloze(raw_html)
 
 
 def parse_bulk_summary_input(raw_text, deck_title="講義要約", existing_cards=None):
     """
-    貼り付けられたテキストが HTML 形式か Markdown 形式かを自動判定し、
-    全チャプターに分割したうえで <u>...</u> および [...] を Cloze に変換して返す。
+    Markdown（`# 1. 章タイトル` 形式）またはHTML一括テキストを受け取り、
+    チャプター単位に分割して `<u>...</u>` をダイナミックCloze化した辞書リストを返す。
+    既存の `existing_cards` がある場合は chapter_idx ごとに GUID・back_extra・休止状態を引き継ぐ。
     """
-    cleaned_all = strip_embedded_style(raw_text)
-    if not cleaned_all:
+    if not raw_text or not raw_text.strip():
         return []
 
-    existing_by_idx = {c.get("chapter_idx"): c for c in (existing_cards or [])}
-    is_html_mode = bool(re.search(r'<div\s+class=["\'](?:meta-header|question-box|feature-box|point-blocks)["\']', cleaned_all, flags=re.IGNORECASE))
+    cleaned_raw = strip_embedded_style(raw_text)
+    existing_by_idx = {}
+    if existing_cards:
+        for c in existing_cards:
+            existing_by_idx[int(c.get("chapter_idx", 0))] = c
 
-    parsed_cards = []
+    results = []
 
-    if is_html_mode:
-        if re.search(r'<div\s+class=["\']meta-header["\']', cleaned_all, flags=re.IGNORECASE):
-            chunks = re.split(r'(?=<div\s+class=["\']meta-header["\'])', cleaned_all, flags=re.IGNORECASE)
+    # パターン1: Markdown のレベル1見出し (`# 1. ...` または `# ...`) で分割
+    md_heading_matches = list(re.finditer(r'(?m)^#\s+(.+)$', cleaned_raw))
+    if md_heading_matches:
+        for i, m in enumerate(md_heading_matches):
+            ch_idx = i + 1
+            ch_title = m.group(1).strip()
+            start_pos = m.end()
+            end_pos = md_heading_matches[i + 1].start() if (i + 1 < len(md_heading_matches)) else len(cleaned_raw)
+            md_body = cleaned_raw[start_pos:end_pos].strip()
+
+            html_card = _markdown_chapter_to_html(md_body, deck_title, ch_idx, ch_title)
+            prev = existing_by_idx.get(ch_idx, {})
+            guid = prev.get("guid") or genanki.guid_for(f"{deck_title}_summary_ch{ch_idx:02d}")
+            results.append({
+                "guid": guid,
+                "chapter_idx": ch_idx,
+                "title": ch_title,
+                "html": html_card,
+                "back_extra": prev.get("back_extra", ""),
+                "is_suspended": prev.get("is_suspended", False),
+                "tags": prev.get("tags", []),
+            })
+        return results
+
+    # パターン2: HTML `<div class="card">` 複数ブロックでの分割
+    card_blocks = re.findall(r'<div\s+class=["\']card["\'][^>]*>(.*?)</div>\s*(?=<div\s+class=["\']card["\']|$)', cleaned_raw, flags=re.DOTALL | re.IGNORECASE)
+    if not card_blocks:
+        card_blocks = [cleaned_raw]
+
+    for i, block in enumerate(card_blocks):
+        ch_idx = i + 1
+        q_match = re.search(r'<div\s+class=["\']question-box["\'][^>]*>(.*?)</div>', block, flags=re.DOTALL | re.IGNORECASE)
+        if q_match:
+            ch_title = BeautifulSoup(q_match.group(1), "html.parser").get_text().strip()
         else:
-            chunks = re.split(r'(?=<div\s+class=["\']question-box["\'])', cleaned_all, flags=re.IGNORECASE)
-        chunks = [c.strip() for c in chunks if c.strip()]
+            ch_title = f"Chapter {ch_idx}"
 
-        for idx, chunk in enumerate(chunks, 1):
-            ch_num = idx
-            m_ch = re.search(r'Chapter\s*(\d+)', chunk, flags=re.IGNORECASE)
-            if m_ch:
-                ch_num = int(m_ch.group(1))
-            else:
-                m_qnum = re.search(r'<div\s+class=["\']question-box["\'][^>]*>\s*(\d+)\.', chunk, flags=re.IGNORECASE)
-                if m_qnum:
-                    ch_num = int(m_qnum.group(1))
+        html_card = convert_markers_to_cloze(block.strip())
+        prev = existing_by_idx.get(ch_idx, {})
+        guid = prev.get("guid") or genanki.guid_for(f"{deck_title}_summary_ch{ch_idx:02d}")
+        results.append({
+            "guid": guid,
+            "chapter_idx": ch_idx,
+            "title": ch_title,
+            "html": html_card,
+            "back_extra": prev.get("back_extra", ""),
+            "is_suspended": prev.get("is_suspended", False),
+            "tags": prev.get("tags", []),
+        })
 
-            m_q = re.search(r'<div\s+class=["\']question-box["\'][^>]*>(.*?)</div>', chunk, flags=re.DOTALL | re.IGNORECASE)
-            title_str = re.sub(r'<[^>]+>', '', m_q.group(1)).strip() if m_q else f"Chapter {ch_num}"
-
-            prev = existing_by_idx.get(ch_num, {})
-            guid = prev.get("guid") or genanki.guid_for(f"{deck_title}_summary_ch{ch_num:02d}")
-            final_html = convert_markers_to_cloze(chunk)
-
-            parsed_cards.append({
-                "guid": guid,
-                "chapter_idx": ch_num,
-                "title": title_str,
-                "html": final_html,
-                "is_suspended": prev.get("is_suspended", False),
-                "tags": prev.get("tags", []),
-            })
-    else:
-        # Markdown モード: `# ` (H1) でチャプター分割
-        md_chunks = re.split(r'(?m)(?=^#\s+)', cleaned_all)
-        md_chunks = [c.strip() for c in md_chunks if c.strip()]
-        total_ch = len(md_chunks)
-
-        for idx, md_chunk in enumerate(md_chunks, 1):
-            ch_num = idx
-            m_num = re.match(r'^#\s+(?:Chapter\s*)?(\d+)[\.\s:：]', md_chunk, flags=re.IGNORECASE)
-            if m_num:
-                ch_num = int(m_num.group(1))
-
-            title_str, raw_html = markdown_chapter_to_html(md_chunk, deck_title, ch_num, total_ch)
-            prev = existing_by_idx.get(ch_num, {})
-            guid = prev.get("guid") or genanki.guid_for(f"{deck_title}_summary_ch{ch_num:02d}")
-            final_html = convert_markers_to_cloze(raw_html)
-
-            parsed_cards.append({
-                "guid": guid,
-                "chapter_idx": ch_num,
-                "title": title_str,
-                "html": final_html,
-                "is_suspended": prev.get("is_suspended", False),
-                "tags": prev.get("tags", []),
-            })
-
-    return parsed_cards
+    return results
 
 
 # ==============================================================================
