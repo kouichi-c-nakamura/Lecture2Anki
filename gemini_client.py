@@ -1,5 +1,6 @@
 import os
 import re
+from urllib import response
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -45,11 +46,8 @@ def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None, return_
         text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
-    clean_html = text.strip()
-
-    if return_usage:
-        return clean_html, usage_record
-    return clean_html
+    text = text.replace(r"\\(", r"\(").replace(r"\\)", r"\)").replace(r"\\[", r"\[").replace(r"\\]", r"\]")
+    return text.strip(), usage_record
 
 
 def call_gemini_summary_back_explanation(front_html, api_key, model_id, deck_title="講義要約"):

@@ -727,9 +727,10 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None,
             else:
                 sort_title = raw_title
 
-            # Back フィールド: Cloze解除済みノート本体 ＋ あればLLM補足解説
+            # Back フィールド: ① Cloze解除済みノート本体 ＋ ② LLM補足解説（二重バックスラッシュも補正）
             back_ai = strip_embedded_style(card.get("back_extra", ""))
-            ai_block = f'<div class="ai-container">{back_ai}</div>' if back_ai else ""
+            back_ai = back_ai.replace(r"\\(", r"\(").replace(r"\\)", r"\)").replace(r"\\[", r"\[").replace(r"\\]", r"\]")
+            ai_block = f'<hr id="answer"><div class="ai-container">{back_ai}</div>' if back_ai else ""
             back_html = f'<div class="back-view">{front_html}</div>{ai_block}'
 
             guid = card.get("guid") or genanki.guid_for(f"{effective_deck_name}_summary_ch{ch_idx:02d}")

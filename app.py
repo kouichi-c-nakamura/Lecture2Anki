@@ -1312,14 +1312,28 @@ with tab_summary_cloze:
             if st.button("次のCh ➡️", disabled=(st.session_state.summary_idx >= total_sum - 1), width="stretch"):
                 st.session_state.summary_idx += 1
                 st.rerun()
-
-        # Front ＆ Back 補足解説プレビュー
-        back_extra_val = cur_card.get("back_extra", "")
+        
+        # Front ＆ Back プレビュー（Front＝Clozeマスク / Back＝Cloze解除済み全文＋AI補足解説）
+        back_extra_clean = (
+            cur_card.get("back_extra", "")
+            .replace(r"\\(", r"\(")
+            .replace(r"\\)", r"\)")
+            .replace(r"\\[", r"\[")
+            .replace(r"\\]", r"\]")
+        )
         back_ai_preview = (
             f'<hr style="margin:16px 0; border:none; border-top:2px dashed #cbd5e1;">'
-            f'<div class="ai-container">{back_extra_val}</div>'
-            if back_extra_val.strip() else ""
+            f'<div class="ai-container">{back_extra_clean}</div>'
+            if back_extra_clean.strip() else ""
         )
+
+        preview_mode = st.radio(
+            "プレビュー表示面",
+            ["🔄 表面 (Front: ダイナミックCloze)", "📖 裏面 (Back: Cloze解除済みノート ＋ AI補足解説)"],
+            horizontal=True,
+            key=f"prev_side_{cur_ch_idx}",
+        )
+        is_back_mode = preview_mode.startswith("📖")
 
         preview_dc_html = f"""
         <style>
@@ -1335,16 +1349,9 @@ with tab_summary_cloze:
             .ai-summary-title {{ color: #d70015; font-weight: bold; margin-bottom: 2px; }}
             .ai-cascade-box {{ background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px; padding: 10px 14px; margin-top: 10px; }}
         </style>
-        <div class="card" id="dc-preview-root" style="border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <span style="font-size:11px; color:#64748b;">💡 黄色いCloze箇所にホバーまたはクリックで解答表示（右ボタンでBack面・全解答切替）</span>
-                <button type="button" onclick="document.getElementById('dc-preview-root').classList.toggle('back-view');" 
-                        style="font-size:11px; padding:3px 10px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1e293b; cursor:pointer; font-weight:600;">
-                    👁️ Front / Back(全解答) 切替
-                </button>
-            </div>
+        <div class="card {'back-view' if is_back_mode else ''}" id="dc-preview-root" style="border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
             {cur_card.get("html", "")}
-            {back_ai_preview}
+            {back_ai_preview if is_back_mode else ""}
         </div>
         <script>
             document.querySelectorAll('#dc-preview-root .cloze-container').forEach(function(el) {{
@@ -1354,7 +1361,7 @@ with tab_summary_cloze:
             }});
         </script>
         """
-        st.components.v1.html(preview_dc_html, height=560 if back_extra_val.strip() else 480, scrolling=True)
+        st.components.v1.html(preview_dc_html, height=620 if is_back_mode else 480, scrolling=True)
 
         # Front / Back 編集コンテナ
         title_key = f"edit_sum_title_{cur_ch_idx}"
