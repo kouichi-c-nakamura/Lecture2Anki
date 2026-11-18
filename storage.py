@@ -17,6 +17,7 @@ from config import (
     DEFAULT_PROMPT,
     SVG_OVERLAY_PROMPT,
 )
+from gemini_pricing import calculate_gemini_cost
 
 
 # ==============================================================================
@@ -205,8 +206,32 @@ def save_ai_cache_to_dir(data, work_dir=None):
     json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 
-def load_summary_cloze_from_dir(work_dir=None):
-    p = get_meta_file_path("summary_cloze_cache.json", work_dir)
+def sanitize_deck_filename_prefix(deck_name):
+    """デッキ名の `::` を `__` に変換し、ファイル名に使用できない文字を置換する"""
+    if not deck_name or not str(deck_name).strip():
+        return "default"
+    s = str(deck_name).strip().replace("::", "__")
+    s = re.sub(r'[\\/:*?"<>|]+', "_", s)
+    return s
+
+
+def get_summary_cloze_filepath(work_dir=None, deck_name=""):
+    """デッキ名に紐づいた summary_cloze JSON の保存パスを返す（旧 summary_cloze_cache.json があれば自動移行）"""
+    target_dir = resolve_meta_dir(work_dir)
+    prefix = sanitize_deck_filename_prefix(deck_name)
+    new_path = os.path.join(target_dir, f"{prefix}_summary_cloze.json")
+    legacy_path = os.path.join(target_dir, "summary_cloze_cache.json")
+
+    if not os.path.exists(new_path) and os.path.exists(legacy_path):
+        try:
+            shutil.copy2(legacy_path, new_path)
+        except Exception:
+            pass
+    return new_path
+
+
+def load_summary_cloze_from_dir(work_dir=None, deck_name=""):
+    p = get_summary_cloze_filepath(work_dir, deck_name)
     if os.path.exists(p):
         try:
             data = json.load(open(p, "r", encoding="utf-8"))
@@ -217,10 +242,11 @@ def load_summary_cloze_from_dir(work_dir=None):
     return []
 
 
-def save_summary_cloze_to_dir(cards_list, work_dir=None):
-    p = get_meta_file_path("summary_cloze_cache.json", work_dir)
+def save_summary_cloze_to_dir(cards_list, work_dir=None, deck_name=""):
+    p = get_summary_cloze_filepath(work_dir, deck_name)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     json.dump(cards_list, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    return p
 
 
 # ==============================================================================

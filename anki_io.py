@@ -561,7 +561,7 @@ def restore_from_anki_export(
     save_ai_cache_to_dir(ai_cache, work_dir)
     save_guid_map_to_dir(guid_map_data, work_dir)
     if restored_summary_cards:
-        save_summary_cloze_to_dir(restored_summary_cards, work_dir)
+        save_summary_cloze_to_dir(restored_summary_cards, work_dir, deck_name=guid_map_data["deck_name"])
 
     return {
         "deck_name": guid_map_data["deck_name"],
@@ -638,7 +638,7 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None,
     effective_deck_name = restored_deck if (guid_map_data.get("is_restored_from_anki") and restored_deck) else (input_deck or restored_deck or "Default_Deck")
 
     if summary_cards is None:
-        summary_cards = load_summary_cloze_from_dir(work_dir)
+        summary_cards = load_summary_cloze_from_dir(work_dir, deck_name=effective_deck_name)
 
     if not files and not summary_cards:
         return "", 0, 0, 0

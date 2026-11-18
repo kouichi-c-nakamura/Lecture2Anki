@@ -6,6 +6,7 @@ import base64
 import subprocess
 import shutil
 import genanki
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from config import (
@@ -36,6 +37,7 @@ from storage import (
     keep_recent_prompt,
     identify_prompt_label,
     load_api_usage_stats,
+    get_summary_cloze_filepath,
 )
 from gemini_client import (
     call_gemini_enhance,
@@ -298,9 +300,15 @@ if all_b_images:
     latest_ts = sorted({os.path.basename(f)[:17] for f in all_b_images})[-1]
     b_images = [f for f in all_b_images if os.path.basename(f).startswith(latest_ts)]
 
-ai_cache = load_ai_cache_from_dir(active_work_dir)
-summary_cards = load_summary_cloze_from_dir(active_work_dir)
+gm_init = load_guid_map_from_dir(active_work_dir)
+active_deck_name = (
+    gm_init.get("deck_name", "").strip()
+    if (gm_init.get("is_restored_from_anki") and gm_init.get("deck_name", "").strip())
+    else st.session_state.get("deck_name_val", "").strip()
+)
 
+ai_cache = load_ai_cache_from_dir(active_work_dir)
+summary_cards = load_summary_cloze_from_dir(active_work_dir, deck_name=active_deck_name)
 
 # ==============================================================================
 # メイン画面タブ構成（4タブ構成）
@@ -1107,6 +1115,8 @@ with tab_ai_inspect:
 with tab_summary_cloze:
     st.subheader("⚡ 要約圧縮ダイナミックCloze (Medical Dynamic Cloze Model 3F)")
     st.caption("Markdown または HTML に `<u>語句</u>` を付けて貼り付けると、全チャプターを一括分割・Cloze化し、同時に裏面（Back）のAI補足解説も並列自動生成します。")
+    cur_sc_json_name = os.path.basename(get_summary_cloze_filepath(active_work_dir, active_deck_name))
+    st.caption(f"保存先JSON: `{cur_sc_json_name}`")
 
     def _batch_generate_all_backs(cards_list, target_model_id, deck_title_label):
         """全チャプターの Back 補足解説を並列API生成して保存する"""
@@ -1142,7 +1152,7 @@ with tab_summary_cloze:
                 pbar.progress(done / total_c)
                 status_txt.text(f"Back解説を並列生成中 ({done}/{total_c} 完了) ｜ 累計実測: 約 {total_jpy:.2f} 円")
 
-        save_summary_cloze_to_dir(cards_list, active_work_dir)
+        save_summary_cloze_to_dir(cards_list, active_work_dir, deck_name=active_deck_name)
         return total_jpy, errors
 
     with st.container(border=True):
@@ -1188,7 +1198,7 @@ with tab_summary_cloze:
                         existing_cards=summary_cards,
                     )
                     if parsed_list:
-                        save_summary_cloze_to_dir(parsed_list, active_work_dir)
+                        save_summary_cloze_to_dir(parsed_list, active_work_dir, deck_name=active_deck_name)
                         for c in parsed_list:
                             st.session_state.pop(f"edit_sum_html_{c['chapter_idx']}", None)
                             st.session_state.pop(f"edit_sum_title_{c['chapter_idx']}", None)
@@ -1240,7 +1250,7 @@ with tab_summary_cloze:
                     "is_suspended": False,
                     "tags": [],
                 })
-                save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                save_summary_cloze_to_dir(summary_cards, active_work_dir, deck_name=active_deck_name)
                 st.session_state.summary_idx = len(summary_cards) - 1
                 st.rerun()
 
@@ -1289,12 +1299,12 @@ with tab_summary_cloze:
             new_sc_sus = st.checkbox("⏸️ 休止", value=is_sc_sus, key=sum_sus_key)
             if new_sc_sus != is_sc_sus:
                 cur_card["is_suspended"] = new_sc_sus
-                save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                save_summary_cloze_to_dir(summary_cards, active_work_dir, deck_name=active_deck_name)
                 st.rerun()
         with s_nav4:
             if st.button("🔢 Cloze連番振直", width="stretch"):
                 cur_card["html"] = renumber_cloze_spans(cur_card.get("html", ""))
-                save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                save_summary_cloze_to_dir(summary_cards, active_work_dir, deck_name=active_deck_name)
                 st.session_state.pop(f"edit_sum_html_{cur_ch_idx}", None)
                 st.toast("✅ Cloze番号を 1. から連番に振り直しました")
                 st.rerun()
@@ -1379,7 +1389,7 @@ with tab_summary_cloze:
                     cur_card["title"] = new_title_val.strip() or f"Chapter {cur_ch_idx}"
                     cur_card["html"] = cleaned_front
                     cur_card["back_extra"] = cleaned_back
-                    save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                    save_summary_cloze_to_dir(summary_cards, active_work_dir, deck_name=active_deck_name)
                     st.session_state.pop(html_key, None)
                     st.session_state.pop(back_key, None)
                     st.toast(f"✅ Chapter {cur_ch_idx} を保存しました！")
@@ -1392,11 +1402,11 @@ with tab_summary_cloze:
                             exp_html, u_rec = call_gemini_summary_back_explanation(
                                 cur_card.get("html", ""),
                                 api_key,
-                                "gemini-3.6-flash",
+                                sc_back_model_id,
                                 deck_title=deck_title_str,
                             )
                             cur_card["back_extra"] = exp_html
-                            save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                            save_summary_cloze_to_dir(summary_cards, active_work_dir, deck_name=active_deck_name)
                             st.session_state.pop(back_key, None)
                             st.toast(f"✅ Back補足解説を生成しました！（約 {u_rec['cost_jpy']:.2f} 円）")
                             st.rerun()
@@ -1407,7 +1417,7 @@ with tab_summary_cloze:
 
                 if st.button("🗑️ このChを削除", width="stretch"):
                     summary_cards.pop(st.session_state.summary_idx)
-                    save_summary_cloze_to_dir(summary_cards, active_work_dir)
+                    save_summary_cloze_to_dir(summary_cards, active_work_dir, deck_name=active_deck_name)
                     st.session_state.summary_idx = max(0, st.session_state.summary_idx - 1)
                     st.rerun()
     else:
@@ -1435,9 +1445,6 @@ with tab_summary_cloze:
 # ==============================================================================
 with tab_build:
     st.subheader("Ankiデッキパッケージ (.apkg) 出力")
-
-    deck_full_name = st.session_state.get("deck_name_val", "")
-    st.write(f"出力先デッキ名: **{deck_full_name}**")
 
     bf = st.session_state.get("base_folder_val", "").strip()
     target_dir = bf if (bf and os.path.exists(bf)) else "."
