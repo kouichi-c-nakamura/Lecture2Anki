@@ -201,7 +201,6 @@ with st.sidebar:
     with col_bf1:
         base_folder = st.text_input(
             "講義フォルダ",
-            value=st.session_state.get("base_folder_val", ""),
             key="base_folder_val",
             on_change=on_base_folder_input_change,
             placeholder="/path/to/lecture_folder",
@@ -222,7 +221,6 @@ with st.sidebar:
 
     parent_deck = st.text_input(
         "親Deck名 (例: ブロック1_呼吸器疾患)",
-        value=st.session_state.get("parent_deck_val", ""),
         key="parent_deck_input",
         on_change=on_deck_naming_change,
         placeholder="ブロック1_呼吸器疾患"
@@ -230,7 +228,6 @@ with st.sidebar:
 
     group_title = st.text_input(
         "グループタイトル (例: 14 呼吸器病治療薬)",
-        value=st.session_state.get("group_title_val", ""),
         key="group_title_input",
         on_change=on_deck_naming_change,
         placeholder="14 呼吸器病治療薬"
@@ -351,7 +348,6 @@ with tab_extract:
         with col_m1:
             masked_pdf = st.text_input(
                 "マスク済みPDF (Masked) パス",
-                value=st.session_state.get("masked_pdf_val", ""),
                 key="masked_pdf_val",
                 on_change=on_masked_input_change,
                 label_visibility="collapsed"
@@ -390,7 +386,6 @@ with tab_extract:
         with col_u1:
             unmasked_pdf = st.text_input(
                 "講義資料PDF (Unmasked) パス",
-                value=st.session_state.get("unmasked_pdf_val", ""),
                 key="unmasked_pdf_val",
                 on_change=on_unmasked_input_change,
                 label_visibility="collapsed"
@@ -408,7 +403,6 @@ with tab_extract:
         with col_u1:
             unmasked_pdf = st.text_input(
                 "講義資料PDF (Unmasked) パス",
-                value=st.session_state.get("unmasked_pdf_val", ""),
                 key="unmasked_pdf_val",
                 on_change=on_unmasked_input_change,
                 label_visibility="collapsed"
@@ -733,7 +727,6 @@ with tab_ai_inspect:
         with nav_chk_col1:
             st.checkbox(
                 "⏸️ 休止",
-                value=is_cur_suspended,
                 key=nav_suspend_key,
                 on_change=on_nav_suspend_toggle(fn, nav_suspend_key),
                 help="Ankiインポート時に休止カード (queue = -1) に設定"
@@ -741,7 +734,6 @@ with tab_ai_inspect:
         with nav_chk_col2:
             st.checkbox(
                 "🎯 対象",
-                value=is_cur_in_batch,
                 key=nav_batch_key,
                 on_change=on_nav_batch_toggle(fn, nav_batch_key),
                 help="一括AI生成・一括休止の対象に含める"
