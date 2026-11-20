@@ -1,4 +1,5 @@
 streamlit>=1.35.0
+beautifulsoup4
 pdf2image>=1.17.0
 pillow>=10.0.0
 genanki>=0.13.1
