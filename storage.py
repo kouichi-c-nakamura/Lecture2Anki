@@ -174,6 +174,19 @@ def resolve_meta_dir(work_dir=None):
         return work_dir
     return "."
 
+def get_meta_file_path(filename, work_dir=None):
+    """メタJSONファイルの実効パス（クラウド配下ならローカルSSDミラーパス）を返す"""
+    target_dir = resolve_meta_dir(work_dir)
+    cloud_p = os.path.join(target_dir, filename)
+    if _is_cloud_storage_path(target_dir):
+        mirror_p = os.path.join(_get_local_mirror_dir(target_dir), filename)
+        if not os.path.exists(mirror_p) and os.path.exists(cloud_p):
+            try:
+                shutil.copy2(cloud_p, mirror_p)
+            except Exception:
+                pass
+        return mirror_p
+    return cloud_p
 
 def load_guid_map_from_dir(work_dir=None):
     target_dir = resolve_meta_dir(work_dir)
