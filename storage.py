@@ -47,7 +47,7 @@ def _atomic_write_json(target_path, data, retries=2):
     一時ファイルに書き出してから os.replace でアトミック置換する。
     OneDrive (FileProvider) の同期ロックによる TimeoutError (Errno 60) を防ぐ。
     """
-    parent = os.path.dirname(target_path)
+    parent = os.path.dirname(target_path) or "."
     os.makedirs(parent, exist_ok=True)
     for attempt in range(retries):
         tmp_path = None
