@@ -47,31 +47,35 @@ DEFAULT_PROMPT = f"""この講義スライド画像を分析し、医学生の�
 SVG_OVERLAY_REQUIREMENTS = r"""【SVGオーバーレイ図示の要件（最上部に配置）】
 0. スライド画像のSVGオーバーレイ図示:
    画像内の重要な解剖学的指標、病変部位、画像所見、病理組織学的特徴を視覚的にポインティングするため、解説の冒頭（<div class="ai-title">の前）に以下の構造でSVGオーバーレイラッパーを出力すること。
-   - 画像のアスペクト比（16:9なら viewBox="0 0 1000 562"、4:3なら viewBox="0 0 1000 750"）に合わせて座標を計算し、対象部位を <ellipse>, <circle>, <rect>, <line> 等で正確に囲み、引き出し線と <text> で [1], [2], [3]... と番号付きの簡潔なラベルを付けること。
-   - 視認性を高めるため、部位ごとに鮮やかな色（#ffea00, #00e5ff, #ff6e40, #ff4081 等）を使い分け、文字には黒縁取り（paint-order: stroke; stroke: #000000; stroke-width: 4.5px;）を適用すること。
-   - 右上角には Toggle とだけ記した表示切替ボタンを配置し、スライドを隠さないよう「ラッパーにマウスホバーした時だけボタンが浮か上がる（通常時 opacity: 0; ➔ ホバー時 opacity: 0.85;）」仕様とすること。
-   - 画像の src 属性には SLIDE_IMAGE.jpg を指定すること（システム側で実ファイル名に自動置換される）。
-   - 以降の【病理的/臨床的的核心】やカスケードの解説本文中では、SVG内で図示した [1], [2]... の番号を引用し、画像上の位置と解説が直感的に対応するように記述すること。
+- **アスペクト比と座標計算の厳守**:
+  - 画像の実寸比率から \( H = \text{round}(1000 \times \text{高さ} / \text{幅}) \) を算出し、`viewBox="0 0 1000 H"` に設定すること（`preserveAspectRatio="none"` は絶対禁止）。
+  - Y座標が1000基準にズレるのを防ぐため、各図形タグ（`<circle>`, `<ellipse>`, `<rect>`, `<line>`）の直前に必ず `<!-- [1] Target: X=78%, Y=25% -> cx=780, cy=H*0.25=188 -->` の形式で掛け算コメントを記述してから座標を指定すること。
+- **インラインスタイルの徹底（`<defs><style>` 禁止）**:
+  - AnkiのWebViewで複数枚のSVGを表示した際にスタイルが消失・競合するのを防ぐため、**`<defs>` や `<style>` タグはSVG内に一切書かず**、すべての `<text>` タグに直接 `style="font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Kaku Gothic ProN', sans-serif; font-size: 16px; font-weight: 800; paint-order: stroke; stroke: #000000; stroke-width: 4.5px; stroke-linecap: round; stroke-linejoin: round;"` をインライン記述すること（補足行は `font-size: 13.5px; font-weight: 700;`）。
+- **視覚デザインとUI**:
+  - 部位ごとに鮮やかな色（`#ffea00`, `#00e5ff`, `#ff6e40`, `#ff4081`, `#69f0ae` 等）を使い分け、`[1]`, `[2]`, `[3]...` と番号付きの簡潔なラベルを付けること。
+  - 右上角には `Toggle` と記した表示切替ボタンを配置し、ホバー時のみ浮かび上がる仕様を維持すること。
+  - 画像の `src` 属性には `SLIDE_IMAGE.jpg` を指定すること。
+  - 以降の【病理的/臨床的的核心】やカスケードの解説本文中では、SVG内で図示した `[1]`, `[2]...` の番号を引用して対応づけること。
 
    ▼ 冒頭に出力するSVGラッパーのテンプレート構造:
-   <div class="svg-overlay-wrap" style="position: relative; display: inline-block; width: 100%; max-width: 850px; line-height: 0; margin-bottom: 16px;">
+   <!-- ImageSize: 960x720, TargetViewBox: 0 0 1000 750 -->
+   <div class="svg-overlay-wrap" style="position: relative; display: block; width: 100%; max-width: 850px; line-height: 0; font-size: 0; margin: 0 auto 16px auto;">
      <style>
        .svg-overlay-wrap .svg-toggle-btn { opacity: 0; transition: opacity 0.2s ease-in-out; }
        .svg-overlay-wrap:hover .svg-toggle-btn { opacity: 0.85; }
        .svg-overlay-wrap .svg-toggle-btn:hover { opacity: 1 !important; }
      </style>
-     <img src="SLIDE_IMAGE.jpg" style="width: 100%; height: auto; display: block;">
-     <button class="svg-toggle-btn" onclick="const s=this.nextElementSibling; s.style.display=s.style.display==='none'?'block':'none';" style="position: absolute; top: 8px; right: 8px; z-index: 10; padding: 4px 10px; font-size: 12px; font-family: monospace; background: rgba(0,0,0,0.75); color: #fff; border: 1px solid #888; border-radius: 4px; cursor: pointer;">
+     <img src="SLIDE_IMAGE.jpg" style="width: 100%; height: auto; display: block; margin: 0; padding: 0;">
+     <button class="svg-toggle-btn" onclick="const s=this.nextElementSibling; s.style.display=s.style.display==='none'?'block':'none';" style="position: absolute; top: 8px; right: 8px; z-index: 10; padding: 4px 10px; font-size: 12px; line-height: 1.2; font-family: monospace; background: rgba(0,0,0,0.75); color: #fff; border: 1px solid #888; border-radius: 4px; cursor: pointer;">
        Toggle
      </button>
-     <svg viewBox="0 0 1000 562" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;">
-       <defs>
-         <style>
-           .lbl { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 15px; font-weight: bold; paint-order: stroke; stroke: #000000; stroke-width: 4.5px; stroke-linecap: round; stroke-linejoin: round; }
-           .sub { font-size: 13px; }
-         </style>
-       </defs>
-       <!-- ここに [1], [2], [3]... の図形・引き出し線・ラベルを記述 -->
+     <svg viewBox="0 0 1000 750" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;">
+       <!-- [1] 右上所見: X=82%, Y=25% -> cx=820, cy=750*0.25=188 -->
+       <circle cx="820" cy="188" r="16" fill="none" stroke="#ffea00" stroke-width="3.5"></circle>
+       <line x1="804" y1="188" x2="700" y2="188" stroke="#ffea00" stroke-width="2.5"></line>
+       <text x="520" y="183" fill="#ffea00" style="font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Kaku Gothic ProN', sans-serif; font-size: 16px; font-weight: 800; paint-order: stroke; stroke: #000000; stroke-width: 4.5px; stroke-linecap: round; stroke-linejoin: round;">[1] ラベル名</text>
+       <text x="520" y="205" fill="#ffea00" style="font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Kaku Gothic ProN', sans-serif; font-size: 13.5px; font-weight: 700; paint-order: stroke; stroke: #000000; stroke-width: 4.5px; stroke-linecap: round; stroke-linejoin: round;">(補足説明)</text>
      </svg>
    </div>"""
 

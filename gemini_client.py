@@ -18,10 +18,15 @@ def call_gemini_enhance(img_path, api_key, model_id, custom_prompt=None, return_
     if is_svg:
         w, h = img.size
         target_h = int(round(1000 * h / w))
-        prompt = re.sub(
-            r'(<svg\s+viewBox=["\']0\s+0\s+1000\s+)\d+(["\'])',
-            rf'\g<1>{target_h}\g<2>',
-            prompt
+        prompt = (
+            f"【システム自動計測による画像サイズ情報】\n"
+            f"入力画像の実寸は {w}x{h} px です。したがって viewBox は必ず `0 0 1000 {target_h}`（H = {target_h}）を使用し、"
+            f"すべてのY座標は `{target_h} * (Y%)` で計算してください。\n\n"
+            + re.sub(
+                r'(<svg\s+viewBox=["\']0\s+0\s+1000\s+)\d+(["\'])',
+                rf'\g<1>{target_h}\g<2>',
+                prompt
+            )
         )
 
     response = client.models.generate_content(
