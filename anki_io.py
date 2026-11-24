@@ -7,9 +7,9 @@ import shutil
 import time
 import zlib
 from datetime import datetime
+from html.parser import HTMLParser
 from PIL import Image
 import genanki
-from bs4 import BeautifulSoup
 from pdf2image import convert_from_path, pdfinfo_from_path
 from config import (
     DEST_DIR,
@@ -22,13 +22,13 @@ from config import (
     DYNAMIC_CLOZE_CSS,
 )
 from storage import (
-    get_meta_file_path,
     load_guid_map_from_dir,
     save_guid_map_to_dir,
     load_ai_cache_from_dir,
     save_ai_cache_to_dir,
     load_summary_cloze_from_dir,
     save_summary_cloze_to_dir,
+    get_meta_file_path,
 )
 
 # ==============================================================================
@@ -61,7 +61,7 @@ def get_poppler_path():
 
 
 # ==============================================================================
-# Anki ノートモデル定義（既存スライドモデル ＆ 新設ダイナミックClozeモデル）
+# Anki ノートモデル定義（既存スライドモデル ＆ 新設ダイナミックCloze 3Fモデル）
 # ==============================================================================
 def get_canonical_model():
     return genanki.Model(
@@ -101,8 +101,8 @@ def get_dynamic_cloze_model():
 """
     combined_css = DYNAMIC_CLOZE_CSS + "\n" + CARD_CSS
     return genanki.Model(
-        851727060,
-        "Medical Dynamic Cloze Model 3F",
+        DYNAMIC_CLOZE_MODEL_ID,
+        DYNAMIC_CLOZE_MODEL_NAME,
         fields=[
             {'name': 'SortTitle'},
             {'name': 'Front'},
@@ -114,8 +114,61 @@ def get_dynamic_cloze_model():
 
 
 # ==============================================================================
-# HTMLクリーニング・<u> / [...] Cloze変換・Markdown決定論的HTML変換パーサー
+# HTMLクリーニング・<u> Cloze変換・Markdown決定論的HTML変換パーサー（標準ライブラリ完結）
 # ==============================================================================
+class _DOMRepairParser(HTMLParser):
+    VOID_TAGS = {"br", "hr", "img", "input", "meta", "link", "col"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.stack = []
+        self.out = []
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        attr_str = "".join(f' {k}="{v}"' if v is not None else f" {k}" for k, v in attrs)
+        self.out.append(f"<{t}{attr_str}>")
+        if t not in self.VOID_TAGS:
+            self.stack.append(t)
+
+    def handle_startendtag(self, tag, attrs):
+        t = tag.lower()
+        attr_str = "".join(f' {k}="{v}"' if v is not None else f" {k}" for k, v in attrs)
+        self.out.append(f"<{t}{attr_str} />")
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t in self.VOID_TAGS or t not in self.stack:
+            return
+        while self.stack:
+            top = self.stack.pop()
+            self.out.append(f"</{top}>")
+            if top == t:
+                break
+
+    def handle_data(self, data):
+        self.out.append(data)
+
+    def handle_entityref(self, name):
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self.out.append(f"&#{name};")
+
+    def get_repaired_html(self):
+        while self.stack:
+            self.out.append(f"</{self.stack.pop()}>")
+        return "".join(self.out)
+
+
+def repair_html_tree(html_str):
+    """Python標準のHTMLParserで未閉鎖タグ・タグ交差・孤立閉じタグを自動修復する"""
+    parser = _DOMRepairParser()
+    parser.feed(html_str)
+    parser.close()
+    return parser.get_repaired_html()
+
+
 def strip_embedded_style(html_str):
     """HTML文字列に埋め込まれた <style>...</style> タグを除去する"""
     if not html_str:
@@ -159,22 +212,11 @@ def normalize_crossed_underline_and_bold(text):
     return text
 
 
-def repair_html_tree(html_str):
-    """
-    BeautifulSoup (html.parser) を通して未閉鎖タグ・タグ交差・孤立閉じタグをDOMレベルで自動修復し、
-    クリーンなHTML文字列として返す。
-    """
-    soup = BeautifulSoup(html_str, "html.parser")
-    if soup.body:
-        return "".join(str(c) for c in soup.body.contents)
-    return str(soup)
-
-
 def convert_markers_to_cloze(html_str):
     """
     1. ** と <u> の交差を正規化
     2. <u>語句</u> を <span class="cloze-container">...</span> に変換（LaTeX [...] には干渉しない）
-    3. BeautifulSoup でHTML階層構造を完全修復
+    3. HTMLParser でHTML階層構造を完全修復
     4. 1. から連番を振る
     """
     s = normalize_crossed_underline_and_bold(html_str)
@@ -339,7 +381,7 @@ def parse_bulk_summary_input(raw_text, deck_title="講義要約", existing_cards
         ch_idx = i + 1
         q_match = re.search(r'<div\s+class=["\']question-box["\'][^>]*>(.*?)</div>', block, flags=re.DOTALL | re.IGNORECASE)
         if q_match:
-            ch_title = BeautifulSoup(q_match.group(1), "html.parser").get_text().strip()
+            ch_title = re.sub(r'<[^>]+>', '', q_match.group(1)).strip()
         else:
             ch_title = f"Chapter {ch_idx}"
 
@@ -468,7 +510,7 @@ def restore_from_anki_export(
         if deck_val and not guid_map_data["deck_name"]:
             guid_map_data["deck_name"] = deck_val
 
-        # A. 新設の要約圧縮ダイナミックClozeモデルの自動判定
+        # A. 要約圧縮ダイナミックClozeモデルの自動判定（3フィールド: SortTitle / Front / Back 対応）
         is_dynamic_cloze = (
             notetype_val == DYNAMIC_CLOZE_MODEL_NAME
             or "cloze-container" in field2
@@ -481,12 +523,22 @@ def restore_from_anki_export(
             if not title_raw:
                 m_q = re.search(r'<div\s+class=["\']question-box["\'][^>]*>(.*?)</div>', clean_body, flags=re.DOTALL | re.IGNORECASE)
                 title_raw = re.sub(r'<[^>]+>', '', m_q.group(1)).strip() if m_q else f"Chapter {restored_summary_count + 1}"
+
+            # 3フィールド形式の場合は row の次の列に Back が入る
+            back_extra_extracted = ""
+            if len(row) > col_idx["back"] + 1 and col_idx["back"] + 1 != col_idx.get("tags", -1):
+                full_back_col = strip_embedded_style(row[col_idx["back"] + 1].strip())
+                m_ai = re.search(r'<div\s+class=["\']ai-container["\']>(.*)</div>\s*$', full_back_col, flags=re.DOTALL | re.IGNORECASE)
+                if m_ai:
+                    back_extra_extracted = m_ai.group(1).strip()
+
             restored_summary_count += 1
             restored_summary_cards.append({
                 "guid": guid,
                 "chapter_idx": restored_summary_count,
                 "title": title_raw,
                 "html": clean_body,
+                "back_extra": back_extra_extracted,
                 "is_suspended": False,
                 "tags": tags_str.split() if tags_str else [],
             })
@@ -549,7 +601,7 @@ def restore_from_anki_export(
 
 
 # ==============================================================================
-# PDF抽出 & APKG混載ビルド（元スライド先 ➔ 要約Cloze後の順序固定）
+# PDF抽出（ページ番号基準の解説・GUID・休止自動引き継ぎ対応） & APKG混載ビルド
 # ==============================================================================
 def parse_pages(page_str, total_pages):
     if not page_str or page_str.strip() == "all":
@@ -565,16 +617,46 @@ def parse_pages(page_str, total_pages):
     return sorted([p for p in pages if 1 <= p <= total_pages])
 
 
-def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password="", dpi=200, dest_dir="exported_jpgs", work_dir=None):
+def _extract_page_num_from_b_img(filename):
+    """'2026-11-24_140000_003b.jpg' または 'p.003' からページ番号 (3) を抽出する"""
+    m = re.search(r'_(\d+)b\.(?:jpg|jpeg|png)$', filename, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m_p = re.search(r'\bp\.(\d+)\b', filename, re.IGNORECASE)
+    if m_p:
+        return int(m_p.group(1))
+    return None
+
+
+def extract_pdf_pages(
+    unmasked_pdf,
+    masked_pdf=None,
+    page_str="all",
+    password="",
+    dpi=200,
+    dest_dir="exported_jpgs",
+    work_dir=None,
+    preserve_existing=True,
+):
     os.makedirs(dest_dir, exist_ok=True)
     poppler_bin = get_poppler_path()
 
-    gm_path = get_meta_file_path("guid_map.json", work_dir)
-    if os.path.exists(gm_path):
-        try:
-            os.remove(gm_path)
-        except Exception:
-            pass
+    # 既存データのバックアップ辞書（ページ番号 -> 既存データ）を構築
+    old_gm = load_guid_map_from_dir(work_dir) if preserve_existing else {"notes": {}}
+    old_notes = old_gm.get("notes", {})
+    old_ai = load_ai_cache_from_dir(work_dir) if preserve_existing else {}
+
+    page_to_old_note = {}
+    for b_fn, meta in old_notes.items():
+        p_no = _extract_page_num_from_b_img(b_fn)
+        if p_no is not None:
+            page_to_old_note[p_no] = meta
+
+    page_to_old_ai = {}
+    for b_fn, html_val in old_ai.items():
+        p_no = _extract_page_num_from_b_img(b_fn)
+        if p_no is not None and html_val:
+            page_to_old_ai[p_no] = html_val
 
     info = pdfinfo_from_path(unmasked_pdf, poppler_path=poppler_bin, userpw=password)
     total_pages = info["Pages"]
@@ -582,6 +664,9 @@ def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password=""
 
     is_pair = bool(masked_pdf and os.path.exists(masked_pdf))
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+    new_notes = {}
+    migrated_ai_count = 0
 
     for p in page_list:
         img_b = convert_from_path(unmasked_pdf, first_page=p, last_page=p, dpi=dpi, poppler_path=poppler_bin, userpw=password)[0]
@@ -598,7 +683,40 @@ def extract_pdf_pages(unmasked_pdf, masked_pdf=None, page_str="all", password=""
             out_name = os.path.join(dest_dir, f"{timestamp}_{p:03d}{suffix}.jpg")
             img.save(out_name, "JPEG", quality=88)
 
-    return timestamp, len(page_list)
+        f_fn = f"{timestamp}_{p:03d}a.jpg"
+        b_fn = f"{timestamp}_{p:03d}b.jpg"
+
+        if preserve_existing and p in page_to_old_note:
+            old_m = page_to_old_note[p]
+            new_notes[b_fn] = {
+                "guid": old_m.get("guid"),
+                "f_img": f_fn,
+                "b_img": b_fn,
+                "is_suspended": old_m.get("is_suspended", False),
+                "tags": old_m.get("tags", []),
+            }
+        else:
+            new_notes[b_fn] = {
+                "f_img": f_fn,
+                "b_img": b_fn,
+                "is_suspended": False,
+                "tags": [],
+            }
+
+        if preserve_existing and p in page_to_old_ai:
+            old_ai[b_fn] = page_to_old_ai[p]
+            migrated_ai_count += 1
+
+    if preserve_existing:
+        merged_gm = dict(old_gm)
+        merged_gm["notes"] = new_notes
+        save_guid_map_to_dir(merged_gm, work_dir)
+        if migrated_ai_count > 0:
+            save_ai_cache_to_dir(old_ai, work_dir)
+    else:
+        save_guid_map_to_dir({"notes": new_notes}, work_dir)
+
+    return timestamp, len(page_list), migrated_ai_count
 
 
 def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None, work_dir=None, summary_cards=None):

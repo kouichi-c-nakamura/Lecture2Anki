@@ -420,6 +420,11 @@ with tab_extract:
 
     col_btn1, col_btn2 = st.columns([1.2, 1])
     with col_btn1:
+        preserve_existing_opt = st.checkbox(
+            "♻️ 既存のAI解説・GUID・休止状態をページ番号順で引き継ぐ（講義前にUnmaskedで解説作成 ➔ 講義後にMasked差し替え時に推奨）",
+            value=True,
+            key="chk_preserve_existing_on_extract",
+        )
         btn_extract = st.button("🖼️ JPEG画像を抽出・生成 (全ページ)", type="primary", width="stretch")
         if btn_extract:
             if not unmasked_pdf or not os.path.exists(unmasked_pdf):
@@ -439,16 +444,18 @@ with tab_extract:
                             "unmasked_pdf": unmasked_pdf,
                             "masked_pdf": st.session_state.get("masked_pdf_val", ""),
                         })
-                    ts, cnt = extract_pdf_pages(
+                    ts, cnt, mig_cnt = extract_pdf_pages(
                         unmasked_pdf,
                         masked_pdf if mode == "事前Cloze済み (Masked PDFあり)" else None,
                         pages_str,
                         pdf_pass,
                         dest_dir=DEST_DIR,
                         work_dir=get_active_work_dir(),
+                        preserve_existing=preserve_existing_opt,
                     )
                     st.session_state.selected_batch_slides = set()
-                    st.success(f"完了: {cnt} ページ分の画像（a/bペア）を exported_jpgs に書き出しました。")
+                    mig_msg = f"（既存のAI解説 {mig_cnt} 件・GUIDを引き継ぎました）" if mig_cnt > 0 else ""
+                    st.success(f"完了: {cnt} ページ分の画像を書き出しました。{mig_msg}")
                     st.rerun()
 
     with col_btn2:
