@@ -6,6 +6,7 @@ import glob
 import shutil
 import time
 import zlib
+import tempfile
 from datetime import datetime
 from html.parser import HTMLParser
 from PIL import Image
@@ -637,6 +638,7 @@ def extract_pdf_pages(
     dest_dir="exported_jpgs",
     work_dir=None,
     preserve_existing=True,
+    deck_name="",
 ):
     os.makedirs(dest_dir, exist_ok=True)
     poppler_bin = get_poppler_path()
@@ -715,6 +717,8 @@ def extract_pdf_pages(
             save_ai_cache_to_dir(old_ai, work_dir)
     else:
         save_guid_map_to_dir({"notes": new_notes}, work_dir)
+        save_ai_cache_to_dir({}, work_dir)
+        save_summary_cloze_to_dir([], work_dir, deck_name=deck_name)
 
     return timestamp, len(page_list), migrated_ai_count
 
@@ -843,5 +847,17 @@ def build_apkg(dest_dir, deck_name, group_title, ai_cache=None, output_dir=None,
     target_dir = output_dir if (output_dir and os.path.exists(output_dir)) else "."
     out_apkg = os.path.join(target_dir, filename)
 
-    genanki.Package(deck, media_files=media_list).write_to_file(out_apkg)
+
+    fd, tmp_apkg = tempfile.mkstemp(prefix=".tmp_", suffix=".apkg")
+    os.close(fd)
+    try:
+        genanki.Package(deck, media_files=media_list).write_to_file(tmp_apkg)
+        shutil.move(tmp_apkg, out_apkg)
+    finally:
+        if os.path.exists(tmp_apkg):
+            try:
+                os.remove(tmp_apkg)
+            except Exception:
+                pass
+
     return out_apkg, len(deck.notes), slide_note_count, summary_note_count
